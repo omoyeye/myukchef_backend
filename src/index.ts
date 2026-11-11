@@ -1,0 +1,121 @@
+import compression from "compression";
+import cors from "cors";
+import express, { NextFunction, Request, Response } from "express";
+import fs from "fs";
+import path from "path";
+import "./db"; // loads .env before anything below reads it
+
+import { authenticate } from "./lib/auth";
+import { UPLOAD_DIR } from "./routes/upload";
+import { startRetentionJobs } from "./lib/accountData";
+import { migrateAllergens } from "./lib/allergens";
+import { startEventJobs } from "./lib/eventQuotes";
+import { notifyChef } from "./lib/notify";
+import { startMealPlanJobs } from "./lib/mealPlans";
+import { renderPageHtml, renderSitemap, SITE_URL } from "./lib/seo";
+import { addressesRouter } from "./routes/addresses";
+import { authRouter } from "./routes/auth";
+import { chefPortalRouter } from "./routes/chefPortal";
+import { chefReviewsRouter } from "./routes/chefReviews";
+import { chefsRouter } from "./routes/chefs";
+import { contactRouter } from "./routes/contact";
+import { discountsRouter } from "./routes/discounts";
+import { eventsRouter } from "./routes/events";
+import { locationRouter } from "./routes/location";
+import { mealPlansRouter } from "./routes/mealPlans";
+import { notificationsRouter } from "./routes/notifications";
+import { ordersRouter } from "./routes/orders";
+import { productsRouter } from "./routes/products";
+import { recommendationsRouter } from "./routes/recommendations";
+import { reviewsRouter } from "./routes/reviews";
+import { settingsRouter } from "./routes/settings";
+import uploadRouter from "./routes/upload";
+import { usersRouter } from "./routes/users";
+
+const app = express();
+const port = process.env.PORT || 3000;
+const isProduction = process.env.NODE_ENV === "production";
+
+app.set("trust proxy", 1);
+app.disable("x-powered-by");
+app.use(compression());
+app.use((_req, res, next) => {
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("X-Frame-Options", "SAMEORIGIN");
+    res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+    res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=(self)");
+    if (isProduction) res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+    next();
+});
+app.use(cors(isProduction ? { origin: [SITE_URL, SITE_URL.replace("https://", "https://www.")] } : undefined));
+app.use(express.json({ limit: "1mb" }));
+app.use(authenticate);
+
+app.use("/api/auth", authRouter);
+app.use("/api/products", productsRouter);
+app.use("/api/orders", ordersRouter);
+app.use("/api/addresses", addressesRouter);
+app.use("/api/reviews", reviewsRouter);
+app.use("/api/discounts", discountsRouter);
+app.use("/api/upload", uploadRouter);
+app.use("/api/settings", settingsRouter);
+app.use("/api/notifications", notificationsRouter);
+app.use("/api/contact", contactRouter);
+app.use("/api/chef-portal", chefPortalRouter);
+app.use("/api/chef-reviews", chefReviewsRouter);
+app.use("/api/meal-plans", mealPlansRouter);
+app.use("/api/chefs", chefsRouter);
+app.use("/api/events", eventsRouter);
+app.use("/api/recommendations", recommendationsRouter);
+app.use("/api/users", usersRouter);
+app.use("/api/location", locationRouter);
+app.use("/api", (_req, res) => res.status(404).json({ error: "Not found" }));
+
+app.use("/uploads", express.static(UPLOAD_DIR, { maxAge: "30d" }));
+
+app.get("/sitemap.xml", async (_req, res, next) => {
+    try {
+        res.type("application/xml").setHeader("Cache-Control", "public, max-age=3600").send(await renderSitemap());
+    } catch (error) { next(error); }
+});
+
+// Built frontend: hashed assets can be cached for a year, the service worker must not be.
+// The website is built separately and served from here in production.
+const distPath = path.resolve(process.env.FRONTEND_DIST || path.join(process.cwd(), "..", "myukchef_frontend", "dist"));
+app.use(express.static(distPath, {
+    index: false,
+    setHeaders: (res, filePath) => {
+        if (filePath.includes(`${path.sep}assets${path.sep}`)) {
+            res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+        } else if (/(sw|registerSW|workbox-[^/\\]*)\.js$|manifest\.webmanifest$/.test(filePath)) {
+            res.setHeader("Cache-Control", "no-cache");
+        }
+    },
+}));
+
+let indexTemplate: string | null = null;
+app.get(/.*/, async (req, res, next) => {
+    try {
+        indexTemplate ??= fs.readFileSync(path.join(distPath, "index.html"), "utf8");
+        res.setHeader("Cache-Control", "no-cache");
+        res.type("html").send(await renderPageHtml(indexTemplate, req.path));
+    } catch (error) { next(error); }
+});
+
+app.use((error: Error & { status?: number; code?: string }, _req: Request, res: Response, _next: NextFunction) => {
+    if (error.code === "ENOENT") return res.status(404).send("The frontend hasn't been built yet. Run npm run build.");
+    if (error.status && error.status < 500) return res.status(error.status).json({ error: error.message });
+    if (error.name === "MulterError") return res.status(400).json({ error: error.message });
+    console.error("Unhandled error:", error);
+    res.status(500).json({ error: "Internal server error" });
+});
+
+app.listen(port, () => {
+    console.log(`Server is running on port ${port}`);
+    startMealPlanJobs();
+    startEventJobs();
+    startRetentionJobs();
+    migrateAllergens()
+        .then(({ chefIds }) => Promise.all(chefIds.map((id) => notifyChef(id, "Please check your dishes' allergens", "We now record all 14 allergens. Your dishes are off sale until you confirm each one under My dishes.", "/chef/dashboard?tab=products"))))
+        .catch((e) => console.error("Allergen update failed:", e));
+});
