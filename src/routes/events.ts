@@ -1,7 +1,8 @@
 import { Request, Router } from "express";
 import { and, asc, desc, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
-import { chefCompliance, chefProducts, chefs, eventQuoteMessages, eventQuotes, events, products, QuoteItem, users } from "../db/schema";
+import { chefCompliance, chefInvoices, chefProducts, chefs, eventQuoteMessages, eventQuotes, events, products, QuoteItem, users } from "../db/schema";
+import { markInvoicePaid, raiseEventInvoice } from "../lib/chefPayouts";
 import { getUserId, isAdmin, requireAdmin, requireAuth } from "../lib/auth";
 import { assertNoContactDetails } from "../lib/contactGuard";
 import { getBankDetails, getCommissionPercent, notifyAdmins, paymentReference, refreshQuoteStage, roundMoney } from "../lib/eventQuotes";
@@ -296,12 +297,24 @@ router.patch("/admin/quotes/:quoteId", requireAdmin, async (req, res) => {
     if (payoutStatus !== undefined) {
         if (!["pending", "paid"].includes(payoutStatus)) throw badRequest("Invalid payout status");
         if (quote.status !== "accepted" || event?.paymentStatus !== "paid") throw badRequest("A chef can only be paid after the customer's payment is received");
-        await db.update(eventQuotes).set({ payoutStatus, payoutPaidAt: payoutStatus === "paid" ? new Date() : null }).where(eq(eventQuotes.id, quote.id));
-        if (payoutStatus === "paid" && quote.payoutStatus !== "paid") {
-            await notifyChef(quote.chefId, "Your payout has been sent", `MYUKCHEF has paid you £${(quote.payoutAmount ?? 0).toFixed(2)} for ${event?.eventName}.`, "/chef/dashboard?tab=bookings");
+        // Once a chef has an invoice, they're paid through it (so a receipt is issued).
+        const [invoice] = await db.select().from(chefInvoices).where(eq(chefInvoices.sourceKey, `event:${quote.id}`)).limit(1);
+        if (invoice && payoutStatus === "paid") {
+            if (invoice.status !== "paid") await markInvoicePaid(invoice.id, { method: "bank", by: getUserId(req) });
+        } else if (invoice && invoice.status === "paid") {
+            throw badRequest("This payout has a receipt, so it can't be undone here.");
+        } else {
+            await db.update(eventQuotes).set({ payoutStatus, payoutPaidAt: payoutStatus === "paid" ? new Date() : null }).where(eq(eventQuotes.id, quote.id));
+            if (payoutStatus === "paid" && quote.payoutStatus !== "paid") {
+                await notifyChef(quote.chefId, "Your payout has been sent", `MYUKCHEF has paid you £${(quote.payoutAmount ?? 0).toFixed(2)} for ${event?.eventName}.`, "/chef/dashboard?tab=bookings");
+            }
         }
     }
-    if (req.body.attended !== undefined) await db.update(eventQuotes).set({ attended: req.body.attended === null ? null : !!req.body.attended }).where(eq(eventQuotes.id, quote.id));
+    if (req.body.attended !== undefined) {
+        await db.update(eventQuotes).set({ attended: req.body.attended === null ? null : !!req.body.attended }).where(eq(eventQuotes.id, quote.id));
+        // The chef turned up: their invoice is raised for them to check and submit.
+        if (req.body.attended === true) await raiseEventInvoice(quote.id).catch((e) => console.error("Event invoice failed:", e));
+    }
     const [updated] = await db.select().from(eventQuotes).where(eq(eventQuotes.id, quote.id)).limit(1);
     res.json(updated);
 });

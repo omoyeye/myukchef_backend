@@ -7,6 +7,24 @@ const badRequest = (message: string) => Object.assign(new Error(message), { stat
 export const DELIVERY_DEFAULTS = { fee: 3.99, serviceFeePercent: 10, freeOver: 0, minOrder: 0 };
 const roundMoney = (n: number) => Math.round(n * 100) / 100;
 
+/** A delivery price band: orders from this amount up pay this fee. A note can explain the arrangement. */
+export interface DeliveryTier { minOrder: number; fee: number; note?: string }
+
+/** Keeps only sensible bands, lowest first. */
+export function cleanTiers(raw: unknown): DeliveryTier[] {
+    if (!Array.isArray(raw)) return [];
+    const tiers = raw
+        .map((t) => ({ minOrder: Number((t as DeliveryTier)?.minOrder), fee: Number((t as DeliveryTier)?.fee), note: typeof (t as DeliveryTier)?.note === "string" ? (t as DeliveryTier).note!.trim().slice(0, 200) : "" }))
+        .filter((t) => Number.isFinite(t.minOrder) && t.minOrder >= 0 && Number.isFinite(t.fee) && t.fee >= 0 && t.fee <= 500)
+        .map((t) => ({ minOrder: roundMoney(t.minOrder), fee: roundMoney(t.fee), ...(t.note ? { note: t.note } : {}) }))
+        .sort((a, b) => a.minOrder - b.minOrder);
+    // One band per starting amount.
+    return tiers.filter((t, i) => i === 0 || t.minOrder !== tiers[i - 1]!.minOrder);
+}
+
+/** The band an order falls in: the highest one it reaches. */
+export const tierFor = (subtotal: number, tiers: DeliveryTier[]) => [...tiers].reverse().find((t) => subtotal >= t.minOrder) ?? null;
+
 async function readSettings(keys: string[]) {
     const rows = await db.select().from(siteSettings).where(inArray(siteSettings.key, keys));
     return Object.fromEntries(rows.map((r) => [r.key, r.value])) as Record<string, any>;
@@ -21,6 +39,7 @@ export async function getOrderSettings() {
             serviceFeePercent: Number(d.serviceFeePercent ?? DELIVERY_DEFAULTS.serviceFeePercent),
             freeOver: Number(d.freeOver ?? DELIVERY_DEFAULTS.freeOver),
             minOrder: Number(d.minOrder ?? DELIVERY_DEFAULTS.minOrder),
+            tiers: cleanTiers(d.tiers),
         },
         isOpen: s.operational_status?.isOpen ?? true,
         loyalty: { enabled: s.loyalty_config?.enabled ?? true, earnRatio: Number(s.loyalty_config?.earnRatio ?? 10) },
@@ -43,12 +62,14 @@ export async function validateDiscount(code: string, amount: number, userId: num
 export function calculateTotals(
     subtotal: number,
     method: "delivery" | "pickup",
-    delivery: { fee: number; serviceFeePercent: number; freeOver: number },
+    delivery: { fee: number; serviceFeePercent: number; freeOver: number; tiers?: DeliveryTier[] },
     discount?: { type: string; value: number } | null,
 ) {
     const serviceFee = subtotal * (delivery.serviceFeePercent / 100);
     const qualifiesForFree = delivery.freeOver > 0 && subtotal >= delivery.freeOver;
-    const deliveryFee = method === "pickup" || subtotal === 0 || qualifiesForFree ? 0 : delivery.fee;
+    // Bigger orders can have their own delivery price, set by the Super Admin.
+    const band = tierFor(subtotal, delivery.tiers ?? []);
+    const deliveryFee = method === "pickup" || subtotal === 0 || qualifiesForFree ? 0 : band ? band.fee : delivery.fee;
     const rawDiscount = !discount ? 0 : discount.type === "percentage" ? subtotal * (discount.value / 100) : discount.value;
     const discountAmount = Math.min(rawDiscount, subtotal);
     return {

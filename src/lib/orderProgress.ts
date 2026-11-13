@@ -1,9 +1,10 @@
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { db } from "../db";
-import { chefCompliance, chefProducts, chefs, orderChefProgress, orderItems, orders, products, users } from "../db/schema";
+import { chefProducts, chefs, orderChefProgress, orderItems, orders, products, users } from "../db/schema";
 import { redactContactDetails } from "./contactGuard";
 import { sendNotificationEmail } from "./mail";
 import { notify, notifyAdmins, notifyChef } from "./notify";
+import { getPayoutRules, raiseOrderInvoice, splitPayout, voidOrderInvoices } from "./chefPayouts";
 import { refundOrder } from "./payments";
 import { getOrderSettings } from "./pricing";
 import { sendSMS } from "./sms";
@@ -166,11 +167,14 @@ export async function moveChefStage(orderId: number, chefId: number, next: unkno
     if (delivered && (typeof proof !== "string" || !PROOF_PHOTO.test(proof))) {
         throw Object.assign(new Error("Add a photo of the food being handed over, so we can pay you."), { status: 400 });
     }
-    const payoutAmount = delivered ? await chefShare(orderId, chefId) : null;
+    // The chef's sales, less MYUKCHEF's commission. Fixed now, so a later change to the rate can't alter it.
+    const split = delivered ? splitPayout(await chefShare(orderId, chefId), (await getPayoutRules()).percent) : null;
+    const commissionPercent = delivered ? (await getPayoutRules()).percent : null;
+    const payoutAmount = split?.net ?? null;
     await db.update(orderChefProgress).set({
         status: next,
         updatedAt: new Date(),
-        ...(delivered ? { deliveryProof: proof as string, deliveredAt: new Date(), payoutAmount, payoutStatus: "pending" } : {}),
+        ...(delivered ? { deliveryProof: proof as string, deliveredAt: new Date(), grossAmount: split!.gross, commissionPercent, payoutAmount, payoutStatus: "pending" } : {}),
     }).where(and(eq(orderChefProgress.orderId, orderId), eq(orderChefProgress.chefId, chefId)));
     mine.status = next;
 
@@ -190,7 +194,7 @@ export async function moveChefStage(orderId: number, chefId: number, next: unkno
         );
         await notifyAdmins(
             `${mine.chefName} delivered order #${order.id}`,
-            `Check the delivery photo and pay ${mine.chefName} £${(payoutAmount ?? 0).toFixed(2)}.`,
+            `The customer has been asked to confirm. ${mine.chefName}'s invoice for £${(payoutAmount ?? 0).toFixed(2)} follows once they do.`,
             "/admin/orders?tab=payouts",
         );
     } else {
@@ -220,10 +224,12 @@ export async function confirmDelivery(orderId: number, viewer: { userId: number 
         await db.update(orderChefProgress)
             .set(received ? { customerConfirmedAt: new Date() } : { customerIssue: redactContactDetails(note) })
             .where(and(eq(orderChefProgress.orderId, order.id), eq(orderChefProgress.chefId, part.chefId)));
+        // Confirmed: the chef's invoice is raised for them to check and submit.
+        if (received && part.progressId) await raiseOrderInvoice(part.progressId).catch((e) => console.error("Invoice failed:", e));
         await notifyChef(
             part.chefId,
             received ? `Order #${order.id} confirmed` : `Problem reported on order #${order.id}`,
-            received ? "The customer confirmed they received your food." : "The customer reported a problem. Our team will be in touch.",
+            received ? "The customer confirmed they received your food. Your invoice is ready to submit." : "The customer reported a problem. Our team will be in touch before you're paid.",
             "/chef/dashboard?tab=orders",
         );
     }
@@ -236,52 +242,38 @@ export async function confirmDelivery(orderId: number, viewer: { userId: number 
     return { confirmed: delivered.length };
 }
 
-/** Delivered parts of orders, with their evidence, for the Super Admin to check and pay. */
-export async function payoutQueue() {
+/** Delivered parts of orders not yet invoiced: waiting for the customer, or with a problem to sort out. */
+export async function deliveriesToCheck() {
     const rows = await db.select({ progress: orderChefProgress, order: orders, chefName: chefs.displayName })
         .from(orderChefProgress)
         .innerJoin(orders, eq(orderChefProgress.orderId, orders.id))
         .innerJoin(chefs, eq(orderChefProgress.chefId, chefs.id))
-        .where(eq(orderChefProgress.status, "completed"))
-        .orderBy(sql`${orderChefProgress.payoutStatus} = 'paid'`, sql`${orderChefProgress.deliveredAt} desc`)
+        .where(and(eq(orderChefProgress.status, "completed"), sql`not exists (select 1 from chef_invoices i where i.source_key = concat('order:', ${orderChefProgress.id}))`))
+        .orderBy(sql`${orderChefProgress.deliveredAt} desc`)
         .limit(300);
-    const chefIds = [...new Set(rows.map((r) => r.progress.chefId))];
-    const banks = new Map(chefIds.length
-        ? (await db.select({ chefId: chefCompliance.chefId, name: chefCompliance.bankAccountName, sortCode: chefCompliance.bankSortCode, accountNumber: chefCompliance.bankAccountNumber })
-            .from(chefCompliance).where(inArray(chefCompliance.chefId, chefIds))).map((b) => [b.chefId, b])
-        : []);
-    return rows.map(({ progress, order, chefName }) => {
-        const bank = banks.get(progress.chefId);
-        return {
-            id: progress.id,
-            orderId: order.id,
-            orderTotal: order.total,
-            chefId: progress.chefId,
-            chefName,
-            deliveryProof: progress.deliveryProof,
-            deliveredAt: progress.deliveredAt,
-            customerConfirmedAt: progress.customerConfirmedAt,
-            customerIssue: progress.customerIssue,
-            payoutAmount: progress.payoutAmount ?? 0,
-            payoutStatus: progress.payoutStatus,
-            paidAt: progress.paidAt,
-            bank: bank?.accountNumber ? { name: bank.name, sortCode: bank.sortCode, accountNumber: bank.accountNumber } : null,
-        };
-    });
+    return rows.map(({ progress, order, chefName }) => ({
+        id: progress.id,
+        orderId: order.id,
+        orderStatus: order.status,
+        paymentStatus: order.paymentStatus,
+        chefId: progress.chefId,
+        chefName,
+        deliveryProof: progress.deliveryProof,
+        deliveredAt: progress.deliveredAt,
+        customerConfirmedAt: progress.customerConfirmedAt,
+        customerIssue: progress.customerIssue,
+        grossAmount: progress.grossAmount ?? progress.payoutAmount ?? 0,
+        payoutAmount: progress.payoutAmount ?? 0,
+    }));
 }
 
-/** The Super Admin pays a chef after checking the evidence (or takes it back if marked by mistake). */
-export async function setPayout(progressId: number, paid: boolean) {
+/** After looking into a reported problem, the Super Admin lets the chef's invoice go ahead. */
+export async function releaseDisputedDelivery(progressId: number) {
     const [part] = await db.select().from(orderChefProgress).where(eq(orderChefProgress.id, progressId)).limit(1);
-    if (!part) throw Object.assign(new Error("Payout not found"), { status: 404 });
-    if (part.status !== "completed" || !part.deliveryProof) throw Object.assign(new Error("This part of the order hasn't been delivered with evidence yet."), { status: 400 });
-    if (paid === (part.payoutStatus === "paid")) return part;
-    await db.update(orderChefProgress).set({ payoutStatus: paid ? "paid" : "pending", paidAt: paid ? new Date() : null }).where(eq(orderChefProgress.id, progressId));
-    if (paid) {
-        await notifyChef(part.chefId, `You've been paid for order #${part.orderId}`, `MYUKCHEF has sent you £${(part.payoutAmount ?? 0).toFixed(2)}. Thank you!`, "/chef/dashboard?tab=orders");
-    }
-    const [updated] = await db.select().from(orderChefProgress).where(eq(orderChefProgress.id, progressId)).limit(1);
-    return updated;
+    if (!part || part.status !== "completed") throw Object.assign(new Error("Delivery not found"), { status: 404 });
+    const invoice = await raiseOrderInvoice(part.id, { force: true });
+    if (!invoice) throw Object.assign(new Error("This order was cancelled or refunded, so there's nothing to pay."), { status: 400 });
+    return invoice;
 }
 
 /** Super Admins don't move orders through kitchens, but they can cancel one or reopen it. */
@@ -293,6 +285,7 @@ export async function adminSetOrderStatus(orderId: number, status: unknown) {
         // A card payment is refunded first; if Stripe refuses, the order stays as it is.
         const refunded = await refundOrder(order);
         await orderStageChanged(order, "cancelled");
+        await voidOrderInvoices(order.id, `Order #${order.id} was cancelled${refunded ? " and refunded" : ""}, so this invoice won't be paid.`);
         if (order.paymentStatus === "awaiting") await db.update(orders).set({ paymentStatus: "failed" }).where(eq(orders.id, order.id));
         // Chefs never saw an unpaid order, so there's nothing to tell them.
         if (order.status !== "awaiting_payment") {

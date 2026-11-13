@@ -11,3 +11,4 @@ dist
 # Files uploaded through the API
 uploads/*
 !uploads/.gitkeep
+private_uploads/

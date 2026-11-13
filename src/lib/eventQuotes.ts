@@ -4,7 +4,7 @@ import { eventQuotes, events, siteSettings } from "../db/schema";
 import { notify } from "./notify";
 
 export const roundMoney = (n: number) => Math.round(n * 100) / 100;
-export const DEFAULT_COMMISSION_PERCENT = 15;
+export const DEFAULT_COMMISSION_PERCENT = 10;
 
 export const paymentReference = (eventId: number) => `MYUK-E${eventId}`;
 

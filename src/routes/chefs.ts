@@ -1,6 +1,10 @@
 import { Router } from "express";
+import fs from "fs";
+import path from "path";
+import { addCredential, CREDENTIAL_TYPES, deleteCredential, hasVerifiedHygiene, listForChef, publicCredentials, reviewCredential, updateCredential } from "../lib/credentials";
+import { privateFilePath } from "./upload";
 import { db } from "../db";
-import { chefCompliance, chefReviews, chefs, chefProducts, eventQuotes, events, favouriteChefs, mealPlans, mealPlanWeeks, orderItems, orders, products, users } from "../db/schema";
+import { chefCompliance, chefCredentials, chefInvoices, chefReviews, chefs, chefProducts, eventQuotes, events, favouriteChefs, mealPlans, mealPlanWeeks, orderItems, orders, products, users } from "../db/schema";
 import { eq, and, desc, inArray, sql } from "drizzle-orm";
 import bcrypt from "bcrypt";
 import crypto from "crypto";
@@ -15,7 +19,8 @@ const router = Router();
 
 // The public site never receives contact details, moderation notes or an exact position.
 const publicChef = <T extends { phone: unknown; userId: unknown; rejectionReason: unknown; location: string | null; latitude: number | null; longitude: number | null }>(chef: T) => {
-    const { phone: _p, userId: _u, rejectionReason: _r, latitude, longitude, ...rest } = chef;
+    // Payout account details are private too.
+    const { phone: _p, userId: _u, rejectionReason: _r, latitude, longitude, stripeAccountId: _s, stripePayoutsEnabled: _e, ...rest } = chef as T & { stripeAccountId?: unknown; stripePayoutsEnabled?: unknown };
     return { ...rest, location: publicArea(chef.location), approxLat: blurCoordinate(latitude), approxLng: blurCoordinate(longitude) };
 };
 
@@ -177,14 +182,16 @@ router.get("/", async (req, res) => {
     try {
         const all = await db.select().from(chefs).where(eq(chefs.status, "approved")).orderBy(desc(chefs.approvedAt));
         const stats = await chefStats(all.map((c) => c.id));
+        const creds = await publicCredentials(all.map((c) => c.id));
+        const badges = (id: number) => ({ hygieneVerified: (creds.get(id) ?? []).some((c) => c.type === "food_hygiene"), verifiedCredentials: (creds.get(id) ?? []).length });
         const origin = parseCoordinates(req.query.lat, req.query.lng);
-        if (!origin) return res.json(all.map((chef) => ({ ...publicChef(chef), ...stats.get(chef.id) })));
+        if (!origin) return res.json(all.map((chef) => ({ ...publicChef(chef), ...stats.get(chef.id), ...badges(chef.id) })));
 
         const withDistance = all.map((chef) => {
             const distanceMiles = chef.latitude !== null && chef.longitude !== null
                 ? Math.round(milesBetween(origin, { lat: chef.latitude, lng: chef.longitude }) * 10) / 10
                 : null;
-            return { ...publicChef(chef), ...stats.get(chef.id), distanceMiles, inServiceArea: distanceMiles !== null && distanceMiles <= chef.serviceRadiusMiles };
+            return { ...publicChef(chef), ...stats.get(chef.id), ...badges(chef.id), distanceMiles, inServiceArea: distanceMiles !== null && distanceMiles <= chef.serviceRadiusMiles };
         });
         // Chefs who serve this area first, then by distance. Chefs with no known location go last.
         withDistance.sort((a, b) =>
@@ -303,7 +310,8 @@ router.delete("/:id", async (req, res) => {
         // Past bookings stay on record without the chef, and the login becomes a customer account.
         const plans = await db.select({ id: mealPlans.id }).from(mealPlans).where(eq(mealPlans.chefId, chefId)).limit(1);
         const quotes = await db.select({ id: eventQuotes.id }).from(eventQuotes).where(eq(eventQuotes.chefId, chefId)).limit(1);
-        if (plans.length > 0 || quotes.length > 0) return res.status(400).json({ error: "This chef has meal plans or event quotes on record. Suspend them instead, so customers keep their history." });
+        const invoices = await db.select({ id: chefInvoices.id }).from(chefInvoices).where(eq(chefInvoices.chefId, chefId)).limit(1);
+        if (plans.length > 0 || quotes.length > 0 || invoices.length > 0) return res.status(400).json({ error: "This chef has meal plans, event quotes or invoices on record. Suspend them instead, so the records are kept." });
         await db.update(events).set({ chefId: null }).where(eq(events.chefId, chefId));
         await db.delete(chefs).where(eq(chefs.id, chefId));
         await db.update(users).set({ role: "customer" }).where(eq(users.id, chef.userId));
@@ -446,6 +454,72 @@ router.patch("/me/products/:id/allergens", async (req, res) => {
     res.json(updated);
 });
 
+// === Certificates and checks (food hygiene, council registration, insurance, DBS) ===
+
+// GET /chefs/me/credentials
+router.get("/me/credentials", async (req, res, next) => {
+    try {
+        const chef = await getChefByUserId(getUserId(req));
+        if (!chef) return res.status(404).json({ error: "Chef profile not found" });
+        res.json({ credentials: await listForChef(chef.id), types: CREDENTIAL_TYPES });
+    } catch (error) { next(error); }
+});
+// POST /chefs/me/credentials
+router.post("/me/credentials", async (req, res, next) => {
+    try {
+        const chef = await getChefByUserId(getUserId(req));
+        if (!chef) return res.status(404).json({ error: "Chef profile not found" });
+        res.status(201).json(await addCredential(chef.id, chef.displayName, req.body ?? {}));
+    } catch (error) { next(error); }
+});
+// PUT /chefs/me/credentials/:id
+router.put("/me/credentials/:id", async (req, res, next) => {
+    try {
+        const chef = await getChefByUserId(getUserId(req));
+        if (!chef) return res.status(404).json({ error: "Chef profile not found" });
+        res.json(await updateCredential(chef.id, chef.displayName, Number(req.params.id), req.body ?? {}));
+    } catch (error) { next(error); }
+});
+// DELETE /chefs/me/credentials/:id
+router.delete("/me/credentials/:id", async (req, res, next) => {
+    try {
+        const chef = await getChefByUserId(getUserId(req));
+        if (!chef) return res.status(404).json({ error: "Chef profile not found" });
+        await deleteCredential(chef.id, Number(req.params.id));
+        res.json({ message: "Removed" });
+    } catch (error) { next(error); }
+});
+// GET /chefs/credentials/:id/document: the private copy, for its chef or a Super Admin only
+router.get("/credentials/:id/document", async (req, res, next) => {
+    try {
+        const userId = getUserId(req);
+        if (!userId) return res.status(401).json({ error: "Please sign in" });
+        const [row] = await db.select().from(chefCredentials).where(eq(chefCredentials.id, Number(req.params.id))).limit(1);
+        const chef = await getChefByUserId(userId);
+        if (!row || !(chef?.id === row.chefId || (await isAdmin(userId)))) return res.status(404).json({ error: "Not found" });
+        const file = privateFilePath(row.document);
+        if (!file || !fs.existsSync(file)) return res.status(404).json({ error: "No copy on file" });
+        res.setHeader("Cache-Control", "private, no-store");
+        res.setHeader("Content-Disposition", `inline; filename="certificate-${row.id}${path.extname(file)}"`);
+        res.sendFile(file);
+    } catch (error) { next(error); }
+});
+// GET /chefs/admin/credentials?status=pending: every chef's certificates, for checking
+router.get("/admin/credentials", requireAdmin, async (req, res, next) => {
+    try {
+        const status = typeof req.query.status === "string" ? req.query.status : null;
+        const rows = await db.select({ credential: chefCredentials, chefName: chefs.displayName }).from(chefCredentials)
+            .innerJoin(chefs, eq(chefCredentials.chefId, chefs.id))
+            .where(status ? eq(chefCredentials.status, status) : undefined)
+            .orderBy(desc(chefCredentials.updatedAt)).limit(500);
+        res.json(rows.map((r) => ({ ...r.credential, chefName: r.chefName, hasDocument: !!r.credential.document })));
+    } catch (error) { next(error); }
+});
+// PATCH /chefs/admin/credentials/:id { status: verified | rejected, note }
+router.patch("/admin/credentials/:id", requireAdmin, async (req, res, next) => {
+    try { res.json(await reviewCredential(Number(req.params.id), req.body?.status, req.body?.note)); } catch (error) { next(error); }
+});
+
 const COMPLIANCE_FIELDS = ["legalName", "dateOfBirth", "addressLine", "city", "postcode", "taxReference", "localAuthority", "registeredOn", "hygieneCertificate", "insurance", "bankAccountName", "bankSortCode", "bankAccountNumber"] as const;
 const COMPLIANCE_LIMITS: Record<string, number> = { dateOfBirth: 10, registeredOn: 10, postcode: 12, taxReference: 40, bankSortCode: 10, bankAccountNumber: 12, bankAccountName: 150, localAuthority: 150, city: 120 };
 const complianceValues = (body: Record<string, unknown>) => Object.fromEntries(COMPLIANCE_FIELDS.map((key) => [key, String(body[key] ?? "").trim().slice(0, COMPLIANCE_LIMITS[key] ?? 200) || null]));
@@ -478,6 +552,7 @@ router.patch("/admin/:id/compliance", requireAdmin, async (req, res) => {
     const chefId = Number(req.params.id);
     const [row] = await db.select().from(chefCompliance).where(eq(chefCompliance.chefId, chefId)).limit(1);
     if (req.body.verified && !complianceComplete(row)) return res.status(400).json({ error: "These details aren't complete yet" });
+    if (req.body.verified && !(await hasVerifiedHygiene(chefId))) return res.status(400).json({ error: "Verify the chef's food hygiene certificate first. It's a requirement before they can be verified." });
     if (row) await db.update(chefCompliance).set({ verifiedAt: req.body.verified ? new Date() : null }).where(eq(chefCompliance.chefId, chefId));
     if (req.body.verified) await notifyChef(chefId, "Your details are verified", "Thanks. We've checked your food safety and payout details.", "/chef/dashboard?tab=compliance");
     res.json({ verified: !!req.body.verified });
@@ -678,7 +753,8 @@ router.get("/:id", async (req, res, next) => {
         const favourite = userId
             ? (await db.select({ id: favouriteChefs.chefId }).from(favouriteChefs).where(and(eq(favouriteChefs.userId, userId), eq(favouriteChefs.chefId, id))).limit(1)).length > 0
             : false;
-        res.json({ ...publicChef(chef), ...stats.get(id), favourite });
+        const credentials = (await publicCredentials([id])).get(id) ?? [];
+        res.json({ ...publicChef(chef), ...stats.get(id), favourite, credentials, hygieneVerified: credentials.some((c) => c.type === "food_hygiene") });
     } catch (error) { next(error); }
 });
 

@@ -4,7 +4,7 @@ import { db } from "../db";
 import { orders, orderItems, products, chefProducts, chefs, users } from "../db/schema";
 import { and, eq, desc, inArray, notInArray } from "drizzle-orm";
 import { announceNewOrder, refreshPayment } from "../lib/orderPlaced";
-import { adminSetOrderStatus, confirmDelivery, payoutQueue, progressForOrder, progressForOrders, setPayout } from "../lib/orderProgress";
+import { adminSetOrderStatus, confirmDelivery, progressForOrder, progressForOrders } from "../lib/orderProgress";
 import { paymentConfig, startCheckout } from "../lib/payments";
 import { getUserId, isAdmin, requireAdmin } from "../lib/auth";
 import { geocode, parseCoordinates } from "../lib/geo";
@@ -22,15 +22,7 @@ const withDishes = <T extends { items: { product: unknown; chefProduct: unknown 
     items: order.items.map(withDish),
 });
 
-// GET /orders/admin/payouts: delivered orders with their evidence, waiting for the chef to be paid
-router.get("/admin/payouts", requireAdmin, async (_req, res, next) => {
-    try { res.json(await payoutQueue()); } catch (error) { next(error); }
-});
-
-// PATCH /orders/admin/payouts/:id { paid }: the Super Admin pays a chef after checking the evidence
-router.patch("/admin/payouts/:id", requireAdmin, async (req, res, next) => {
-    try { res.json(await setPayout(Number(req.params.id), req.body?.paid !== false)); } catch (error) { next(error); }
-});
+// Chef invoices and payouts live under /api/payouts.
 
 // POST /orders/:id/confirm-delivery { received, issue?, t? }: the customer confirms, or reports a problem
 router.post("/:id/confirm-delivery", async (req, res, next) => {

@@ -22,6 +22,9 @@ import { contactRouter } from "./routes/contact";
 import { discountsRouter } from "./routes/discounts";
 import { eventsRouter } from "./routes/events";
 import { integrationsRouter } from "./routes/integrations";
+import { payoutsRouter } from "./routes/payouts";
+import { startPayoutJobs } from "./lib/chefPayouts";
+import { startCredentialJobs } from "./lib/credentials";
 import { stripeWebhook } from "./routes/payments";
 import { releaseStaleUnpaidOrders } from "./lib/orderPlaced";
 import { locationRouter } from "./routes/location";
@@ -77,9 +80,12 @@ app.use("/api/recommendations", recommendationsRouter);
 app.use("/api/users", usersRouter);
 app.use("/api/location", locationRouter);
 app.use("/api/admin/integrations", integrationsRouter);
+app.use("/api/payouts", payoutsRouter);
 app.use("/api", (_req, res) => res.status(404).json({ error: "Not found" }));
 
 app.use("/uploads", express.static(UPLOAD_DIR, { maxAge: "30d" }));
+// A missing upload is a 404, not the website's home page.
+app.use("/uploads", (_req, res) => res.status(404).end());
 
 app.get("/sitemap.xml", async (_req, res, next) => {
     try {
@@ -123,6 +129,8 @@ app.listen(port, () => {
     startMealPlanJobs();
     startEventJobs();
     startRetentionJobs();
+    startPayoutJobs();
+    startCredentialJobs();
     // Unpaid orders whose payment page ran out are released, in case Stripe's webhook didn't arrive.
     setInterval(() => releaseStaleUnpaidOrders().catch((e) => console.error("Unpaid order check failed:", e)), 15 * 60 * 1000).unref();
     migrateAllergens()

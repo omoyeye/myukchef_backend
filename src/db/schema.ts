@@ -23,6 +23,9 @@ export const chefs = mysqlTable("chefs", {
     // A short (up to one minute) video of the kitchen, so customers can see where their food is made.
     kitchenVideo: text("kitchen_video"),
     kitchenVideoUpdatedAt: timestamp("kitchen_video_updated_at"),
+    // The chef's Stripe Connect account, so MYUKCHEF can pay them automatically.
+    stripeAccountId: varchar("stripe_account_id", { length: 64 }),
+    stripePayoutsEnabled: boolean("stripe_payouts_enabled").default(false).notNull(),
     specialty: text("specialty"),
     avatar: text("avatar"),
     coverImage: text("cover_image"),
@@ -206,12 +209,71 @@ export const orderChefProgress = mysqlTable("order_chef_progress", {
     deliveredAt: timestamp("delivered_at"),
     customerConfirmedAt: timestamp("customer_confirmed_at"),
     customerIssue: text("customer_issue"),
-    // What MYUKCHEF owes the chef for their dishes (service and delivery fees stay with MYUKCHEF),
-    // paid once a Super Admin has checked the evidence.
+    // Confirmed automatically when the customer neither confirms nor reports a problem in time.
+    autoConfirmed: boolean("auto_confirmed").default(false).notNull(),
+    // The chef's dishes at the prices paid, MYUKCHEF's commission, and what the chef receives.
+    grossAmount: double("gross_amount"),
+    commissionPercent: double("commission_percent"),
     payoutAmount: double("payout_amount"),
     payoutStatus: varchar("payout_status", { length: 20 }).default("pending").notNull(), // pending | paid
     paidAt: timestamp("paid_at"),
 }, (t) => ({ oneEach: unique("order_chef_unique").on(t.orderId, t.chefId) }));
+
+// An invoice MYUKCHEF raises for each delivered order part or attended event. The chef checks and
+// submits it, MYUKCHEF pays them (automatically through Stripe where it can), and a receipt is issued.
+export const chefInvoices = mysqlTable("chef_invoices", {
+    id: int("id").autoincrement().primaryKey(),
+    number: varchar("number", { length: 32 }).notNull().unique(),
+    chefId: int("chef_id").references(() => chefs.id, { onDelete: "restrict" }).notNull(),
+    kind: varchar("kind", { length: 10 }).notNull(), // order | event
+    // One invoice per delivered order part ("order:<progress id>") or attended event ("event:<quote id>").
+    sourceKey: varchar("source_key", { length: 40 }).notNull().unique(),
+    orderId: int("order_id").references(() => orders.id, { onDelete: "set null" }),
+    progressId: int("progress_id").references(() => orderChefProgress.id, { onDelete: "set null" }),
+    quoteId: int("quote_id"),
+    description: varchar("description", { length: 255 }).notNull(),
+    grossAmount: double("gross_amount").notNull(),
+    commissionPercent: double("commission_percent").notNull(),
+    commissionAmount: double("commission_amount").notNull(),
+    netAmount: double("net_amount").notNull(),
+    // awaiting_chef | submitted | processing | paid | held | void
+    status: varchar("status", { length: 20 }).default("awaiting_chef").notNull(),
+    holdReason: text("hold_reason"),
+    // The chef's details as they stood when the invoice was raised, so the record never changes.
+    chefDetails: json("chef_details").$type<Record<string, string | null>>(),
+    submittedAt: timestamp("submitted_at"),
+    submittedName: varchar("submitted_name", { length: 150 }),
+    paidAt: timestamp("paid_at"),
+    payMethod: varchar("pay_method", { length: 20 }), // stripe | bank
+    stripeTransferId: varchar("stripe_transfer_id", { length: 64 }),
+    paidBy: int("paid_by").references(() => users.id, { onDelete: "set null" }),
+    payoutError: text("payout_error"),
+    receiptNumber: varchar("receipt_number", { length: 32 }).unique(),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+});
+
+// Evidence a chef is trained and checked: food hygiene certificates, council registration, insurance,
+// a DBS check. A Super Admin verifies each one; verified ones can show on the chef's public page.
+export const chefCredentials = mysqlTable("chef_credentials", {
+    id: int("id").autoincrement().primaryKey(),
+    chefId: int("chef_id").references(() => chefs.id, { onDelete: "cascade" }).notNull(),
+    // food_hygiene | allergen_awareness | council_registration | hygiene_rating | insurance | dbs_check | other
+    type: varchar("type", { length: 30 }).notNull(),
+    title: varchar("title", { length: 150 }).notNull(),
+    issuer: varchar("issuer", { length: 150 }),
+    reference: varchar("reference", { length: 80 }),
+    level: varchar("level", { length: 20 }),
+    issuedOn: varchar("issued_on", { length: 10 }),
+    expiresOn: varchar("expires_on", { length: 10 }),
+    // A private file, only shown to the chef and Super Admins. Never used for DBS checks.
+    document: varchar("document", { length: 255 }),
+    status: varchar("status", { length: 20 }).default("pending").notNull(), // pending | verified | rejected | expired
+    reviewNote: varchar("review_note", { length: 300 }),
+    verifiedAt: timestamp("verified_at"),
+    showOnProfile: boolean("show_on_profile").default(true).notNull(),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+    updatedAt: timestamp("updated_at").defaultNow().notNull(),
+});
 
 export const passwordResetTokens = mysqlTable("password_reset_tokens", {
     id: int("id").autoincrement().primaryKey(),

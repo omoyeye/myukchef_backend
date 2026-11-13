@@ -3,7 +3,7 @@ import crypto from "crypto";
 import { and, eq, inArray, lt } from "drizzle-orm";
 import { db } from "../db";
 import {
-    addresses, chefReviews, chefs, eventQuoteMessages, eventQuotes, events, favouriteChefs, mealPlanMessages, mealPlans, notificationPreferences,
+    addresses, chefCredentials, chefInvoices, chefReviews, chefs, eventQuoteMessages, eventQuotes, events, favouriteChefs, mealPlanMessages, mealPlans, notificationPreferences,
     notifications, orderChefProgress, orderItems, orders, passwordResetTokens, pushSubscriptions, mobilePushTokens, reviews, supportMessages, users,
 } from "../db/schema";
 
@@ -29,7 +29,9 @@ export async function exportUserData(userId: number) {
         savedChefs: await db.select().from(favouriteChefs).where(eq(favouriteChefs.userId, userId)),
         notifications: await db.select().from(notifications).where(eq(notifications.userId, userId)),
         notificationPreferences: await db.select().from(notificationPreferences).where(eq(notificationPreferences.userId, userId)),
-        chefProfile: chefProfile ?? null,
+        chefProfile: chefProfile ? (({ stripeAccountId: _s, ...p }) => p)(chefProfile) : null,
+        chefCertificates: chefProfile ? (await db.select().from(chefCredentials).where(eq(chefCredentials.chefId, chefProfile.id))).map(({ document, ...c }) => ({ ...c, copyOnFile: !!document })) : [],
+        chefInvoices: chefProfile ? await db.select().from(chefInvoices).where(eq(chefInvoices.chefId, chefProfile.id)) : [],
     };
 }
 
