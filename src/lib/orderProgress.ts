@@ -4,6 +4,7 @@ import { chefCompliance, chefProducts, chefs, orderChefProgress, orderItems, ord
 import { redactContactDetails } from "./contactGuard";
 import { sendNotificationEmail } from "./mail";
 import { notify, notifyAdmins, notifyChef } from "./notify";
+import { refundOrder } from "./payments";
 import { getOrderSettings } from "./pricing";
 import { sendSMS } from "./sms";
 
@@ -150,6 +151,7 @@ export async function moveChefStage(orderId: number, chefId: number, next: unkno
     const [order] = await db.select().from(orders).where(eq(orders.id, orderId)).limit(1);
     if (!order) throw Object.assign(new Error("Order not found"), { status: 404 });
     if (order.status === "cancelled") throw Object.assign(new Error("This order was cancelled."), { status: 400 });
+    if (order.status === "awaiting_payment") throw Object.assign(new Error("This order hasn't been paid yet."), { status: 400 });
     if (!isStage(next) || next === "received") throw Object.assign(new Error("Invalid stage"), { status: 400 });
 
     const progress = await progressForOrder(order);
@@ -288,13 +290,24 @@ export async function adminSetOrderStatus(orderId: number, status: unknown) {
     if (!order) throw Object.assign(new Error("Order not found"), { status: 404 });
     if (status === "cancelled") {
         if (order.status === "cancelled") return order;
+        // A card payment is refunded first; if Stripe refuses, the order stays as it is.
+        const refunded = await refundOrder(order);
         await orderStageChanged(order, "cancelled");
-        for (const p of await progressForOrder(order)) {
-            await notifyChef(p.chefId, `Order #${order.id} was cancelled`, "You no longer need to prepare this order.", "/chef/dashboard?tab=orders");
+        if (order.paymentStatus === "awaiting") await db.update(orders).set({ paymentStatus: "failed" }).where(eq(orders.id, order.id));
+        // Chefs never saw an unpaid order, so there's nothing to tell them.
+        if (order.status !== "awaiting_payment") {
+            for (const p of await progressForOrder(order)) {
+                await notifyChef(p.chefId, `Order #${order.id} was cancelled`, "You no longer need to prepare this order.", "/chef/dashboard?tab=orders");
+            }
         }
-        await notifyCustomer(order, `Order #${order.id} cancelled`, `Your order #${order.id} has been cancelled. Contact us if you have any questions.`);
+        await notifyCustomer(order, `Order #${order.id} cancelled`, refunded
+            ? `Your order #${order.id} has been cancelled and your payment of £${order.total.toFixed(2)} refunded to your card. It can take 5 to 10 days to show.`
+            : `Your order #${order.id} has been cancelled. Contact us if you have any questions.`);
     } else if (status === "received") {
         if (order.status !== "cancelled") throw Object.assign(new Error("Only a cancelled order can be reopened."), { status: 400 });
+        if (["refunded", "failed", "awaiting"].includes(order.paymentStatus)) {
+            throw Object.assign(new Error(order.paymentStatus === "refunded" ? "This order was refunded, so it can't be reopened. The customer can order again." : "This order was never paid for, so it can't be reopened."), { status: 400 });
+        }
         await db.update(orderChefProgress).set({ status: "received", updatedAt: new Date() }).where(eq(orderChefProgress.orderId, order.id));
         await orderStageChanged(order, "received");
         for (const p of await progressForOrder({ ...order, status: "received" })) {

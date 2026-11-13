@@ -1,5 +1,5 @@
 import { Request, Router } from "express";
-import { and, asc, desc, eq, inArray, or } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, ne, or } from "drizzle-orm";
 import { db } from "../db";
 import { chefProducts, chefs, eventQuoteMessages, eventQuotes, events, orderItems, orders, products, users } from "../db/schema";
 import { getUserId, requireAuth } from "../lib/auth";
@@ -43,7 +43,8 @@ router.get("/orders", async (req, res) => {
         .innerJoin(orders, eq(orderItems.orderId, orders.id))
         .leftJoin(chefProducts, eq(orderItems.chefProductId, chefProducts.id))
         .leftJoin(products, eq(orderItems.productId, products.id))
-        .where(or(eq(chefProducts.chefId, chef.id), eq(products.chefId, chef.id)))
+        // Unpaid orders stay hidden until the customer has paid.
+        .where(and(or(eq(chefProducts.chefId, chef.id), eq(products.chefId, chef.id)), ne(orders.status, "awaiting_payment")))
         .orderBy(desc(orders.createdAt))
         .limit(300);
 

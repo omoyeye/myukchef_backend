@@ -21,6 +21,9 @@ import { chefsRouter } from "./routes/chefs";
 import { contactRouter } from "./routes/contact";
 import { discountsRouter } from "./routes/discounts";
 import { eventsRouter } from "./routes/events";
+import { integrationsRouter } from "./routes/integrations";
+import { stripeWebhook } from "./routes/payments";
+import { releaseStaleUnpaidOrders } from "./lib/orderPlaced";
 import { locationRouter } from "./routes/location";
 import { mealPlansRouter } from "./routes/mealPlans";
 import { notificationsRouter } from "./routes/notifications";
@@ -47,7 +50,11 @@ app.use((_req, res, next) => {
     if (isProduction) res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
     next();
 });
-app.use(cors(isProduction ? { origin: [SITE_URL, SITE_URL.replace("https://", "https://www.")] } : undefined));
+// The website may live on its own domain once it has its own repo: list extra sites in CORS_ORIGINS.
+const extraOrigins = (process.env.CORS_ORIGINS || "").split(",").map((o) => o.trim().replace(/\/$/, "")).filter(Boolean);
+app.use(cors(isProduction ? { origin: [SITE_URL, SITE_URL.replace("https://", "https://www."), ...extraOrigins] } : undefined));
+// Stripe signs the exact bytes it sends, so its webhook reads the raw body.
+app.post("/api/payments/stripe/webhook", express.raw({ type: "application/json", limit: "1mb" }), stripeWebhook);
 app.use(express.json({ limit: "1mb" }));
 app.use(authenticate);
 
@@ -69,6 +76,7 @@ app.use("/api/events", eventsRouter);
 app.use("/api/recommendations", recommendationsRouter);
 app.use("/api/users", usersRouter);
 app.use("/api/location", locationRouter);
+app.use("/api/admin/integrations", integrationsRouter);
 app.use("/api", (_req, res) => res.status(404).json({ error: "Not found" }));
 
 app.use("/uploads", express.static(UPLOAD_DIR, { maxAge: "30d" }));
@@ -115,6 +123,8 @@ app.listen(port, () => {
     startMealPlanJobs();
     startEventJobs();
     startRetentionJobs();
+    // Unpaid orders whose payment page ran out are released, in case Stripe's webhook didn't arrive.
+    setInterval(() => releaseStaleUnpaidOrders().catch((e) => console.error("Unpaid order check failed:", e)), 15 * 60 * 1000).unref();
     migrateAllergens()
         .then(({ chefIds }) => Promise.all(chefIds.map((id) => notifyChef(id, "Please check your dishes' allergens", "We now record all 14 allergens. Your dishes are off sale until you confirm each one under My dishes.", "/chef/dashboard?tab=products"))))
         .catch((e) => console.error("Allergen update failed:", e));

@@ -1,6 +1,4 @@
-
-const BREVO_API_KEY = process.env.BREVO_API_KEY;
-const BREVO_SMS_SENDER = process.env.BREVO_SMS_SENDER || "MYUKCHEF";
+import { getBrevo } from "./integrations";
 
 /**
  * Send a transactional SMS via Brevo
@@ -8,8 +6,9 @@ const BREVO_SMS_SENDER = process.env.BREVO_SMS_SENDER || "MYUKCHEF";
  * @param text The SMS content
  */
 export async function sendSMS(to: string, text: string) {
+    const { apiKey: BREVO_API_KEY, smsSender: BREVO_SMS_SENDER } = await getBrevo();
     if (!BREVO_API_KEY) {
-        console.warn("BREVO_API_KEY not set. SMS skipped.");
+        console.warn("No Brevo API key set. SMS skipped.");
         return;
     }
 

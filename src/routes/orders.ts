@@ -1,14 +1,11 @@
 import crypto from "crypto";
-import { allergenName } from "../lib/allergens";
-import { getPreferences, notifyChef } from "../lib/notify";
-import { sendPush } from "../lib/push";
 import { Router } from "express";
 import { db } from "../db";
-import { orders, orderItems, products, chefProducts, chefs, users, notifications, siteSettings } from "../db/schema";
-import { and, eq, desc, inArray, sql } from "drizzle-orm";
-import { sendOrderConfirmationEmail, sendAdminOrderAlert } from "../lib/mail";
+import { orders, orderItems, products, chefProducts, chefs, users } from "../db/schema";
+import { and, eq, desc, inArray, notInArray } from "drizzle-orm";
+import { announceNewOrder, refreshPayment } from "../lib/orderPlaced";
 import { adminSetOrderStatus, confirmDelivery, payoutQueue, progressForOrder, progressForOrders, setPayout } from "../lib/orderProgress";
-import { sendSMS } from "../lib/sms";
+import { paymentConfig, startCheckout } from "../lib/payments";
 import { getUserId, isAdmin, requireAdmin } from "../lib/auth";
 import { geocode, parseCoordinates } from "../lib/geo";
 import { badRequest, calculateTotals, getOrderSettings, validateDiscount } from "../lib/pricing";
@@ -39,6 +36,38 @@ router.patch("/admin/payouts/:id", requireAdmin, async (req, res, next) => {
 router.post("/:id/confirm-delivery", async (req, res, next) => {
     try {
         res.json(await confirmDelivery(Number(req.params.id), { userId: getUserId(req), token: req.body?.t }, req.body?.received !== false, req.body?.issue));
+    } catch (error) { next(error); }
+});
+
+// GET /orders/payment-config: whether checkout takes card payments
+router.get("/payment-config", async (_req, res, next) => {
+    try { res.json(await paymentConfig()); } catch (error) { next(error); }
+});
+
+/** The customer (signed in, or holding the tracking link) or a Super Admin. */
+async function canManageOrder(req: Parameters<typeof getUserId>[0], order: typeof orders.$inferSelect, token: unknown) {
+    const viewerId = getUserId(req);
+    return (!!order.trackingToken && token === order.trackingToken) || (!!viewerId && order.userId === viewerId) || (await isAdmin(viewerId));
+}
+
+// POST /orders/:id/pay { t? }: sends the customer back to Stripe for an order they haven't paid yet
+router.post("/:id/pay", async (req, res, next) => {
+    try {
+        const [order] = await db.select().from(orders).where(eq(orders.id, Number(req.params.id))).limit(1);
+        if (!order) return res.status(404).json({ error: "Order not found" });
+        if (!(await canManageOrder(req, order, req.body?.t))) return res.status(403).json({ error: "Forbidden" });
+        const address = (order.deliveryAddress ?? {}) as { email?: string };
+        res.json({ checkoutUrl: await startCheckout(order, address.email) });
+    } catch (error) { next(error); }
+});
+
+// POST /orders/:id/payment-status { t? }: checks with Stripe when the customer comes back from paying
+router.post("/:id/payment-status", async (req, res, next) => {
+    try {
+        const [order] = await db.select().from(orders).where(eq(orders.id, Number(req.params.id))).limit(1);
+        if (!order) return res.status(404).json({ error: "Order not found" });
+        if (!(await canManageOrder(req, order, req.body?.t))) return res.status(403).json({ error: "Forbidden" });
+        res.json(await refreshPayment(order.id));
     } catch (error) { next(error); }
 });
 
@@ -78,7 +107,8 @@ router.get("/stats", async (req, res) => {
             return res.status(403).json({ error: "Forbidden: Admins only" });
         }
 
-        const allOrders = await db.select().from(orders);
+        // Unpaid and cancelled orders aren't sales.
+        const allOrders = await db.select().from(orders).where(notInArray(orders.status, ["awaiting_payment", "cancelled"]));
         const totalRevenue = allOrders.reduce((sum, order) => sum + (order.total || 0), 0);
         const activeOrders = allOrders.filter(o => ['received', 'preparing', 'delivery', 'pending'].includes(o.status)).length;
 
@@ -165,7 +195,7 @@ router.get("/:id", async (req, res) => {
         const viewerId = getUserId(req);
         const hasLink = !!order.trackingToken && req.query.t === order.trackingToken;
         const canSeeDetails = hasLink || (viewerId && order.userId === viewerId) || (await isAdmin(viewerId));
-        const { deliveryAddress, deliveryLat, deliveryLng, courierLat, courierLng, courierUpdatedAt, trackingToken: _token, ...publicOrder } = order;
+        const { deliveryAddress, deliveryLat, deliveryLng, courierLat, courierLng, courierUpdatedAt, trackingToken: _token, stripeSessionId: _session, stripePaymentIntentId: _intent, ...publicOrder } = order;
         const courierIsLive = order.status === "delivery" && !!courierUpdatedAt && Date.now() - new Date(courierUpdatedAt).getTime() < 30 * 60 * 1000;
 
         // Anyone with the order number sees each chef's stage; the evidence is only for the customer and staff.
@@ -301,6 +331,8 @@ router.post("/", async (req, res) => {
         const { total: serverCalculatedTotal } = calculateTotals(subtotal, deliveryMethod, orderSettings.delivery, discount);
 
         // 4. Create Order
+        const { cardPayments } = await paymentConfig();
+        if (cardPayments && serverCalculatedTotal < 0.3) throw badRequest("Card payments need an order of at least 30p.");
         // Used for the tracking map. A failed lookup never blocks an order.
         const destination = deliveryMethod === 'delivery'
             ? await geocode(deliveryAddress?.postcode || [deliveryAddress?.line1, deliveryAddress?.city].filter(Boolean).join(', '))
@@ -313,7 +345,9 @@ router.post("/", async (req, res) => {
             userId: userId ? Number(userId) : null,
             total: serverCalculatedTotal,
             deliveryAddress: { ...deliveryAddress, method: deliveryMethod, discountCode: discount?.code ?? null },
-            status: "received",
+            // With card payments on, nobody hears about the order until Stripe says it's paid.
+            status: cardPayments ? "awaiting_payment" : "received",
+            paymentStatus: cardPayments ? "awaiting" : "not_required",
         }).$returningId();
         const [newOrder] = await db.select().from(orders).where(eq(orders.id, newOrderId)).limit(1);
 
@@ -329,56 +363,22 @@ router.post("/", async (req, res) => {
         }));
 
         await db.insert(orderItems).values(orderItemsData);
-        await progressForOrder(newOrder);
 
-        // Allergen details go with the order, and each chef whose dishes are in it is told.
-        const orderLines = items.map((item: any) => {
-            const dish = productMap.get(item.menuItem.id)!;
-            const names = (dish.allergens ?? []).map(allergenName);
-            return { name: dish.name, quantity: item.quantity, allergens: names.length ? `Contains ${names.join(", ")}` : "No listed allergens", chefId: dish.chefId };
-        });
-        for (const chefId of new Set(orderLines.map((l: { chefId: number | null }) => l.chefId).filter(Boolean))) {
-            const mine = orderLines.filter((l: { chefId: number | null }) => l.chefId === chefId);
-            await notifyChef(chefId as number, `New order #${newOrder.id}`, `${mine.map((l: { quantity: number; name: string }) => `${l.quantity} x ${l.name}`).join(", ")}. Move it to "Cooking" when you start, so the customer knows.`, "/chef/dashboard?tab=orders");
+        const [orderUser] = userId ? await db.select({ email: users.email }).from(users).where(eq(users.id, userId)).limit(1) : [];
+        if (cardPayments) {
+            let checkoutUrl: string;
+            try {
+                checkoutUrl = await startCheckout(newOrder, deliveryAddress?.email || orderUser?.email);
+            } catch (error) {
+                // Without a payment page the order can't go ahead.
+                await db.update(orders).set({ status: "cancelled", paymentStatus: "failed" }).where(eq(orders.id, newOrder.id));
+                console.error("Stripe checkout failed:", (error as Error).message);
+                return res.status(502).json({ error: "We couldn't open the payment page. Please try again in a moment." });
+            }
+            return res.status(201).json({ ...newOrder, checkoutUrl });
         }
 
-        // --- Notifications ---
-        // 1. Email to Customer (guests give their email at checkout)
-        const [orderUser] = userId ? await db.select().from(users).where(eq(users.id, userId)).limit(1) : [];
-        const customerEmail = deliveryAddress?.email || orderUser?.email;
-        if (customerEmail) {
-            sendOrderConfirmationEmail(customerEmail, newOrder, orderLines).catch((err: any) => console.error("Customer email failed:", err));
-        }
-
-        // 2. Alert to Admin (Fetch admin email from settings)
-        const [adminEmailSetting] = await db.select().from(siteSettings).where(eq(siteSettings.key, 'admin_alert_email')).limit(1);
-        const adminEmail = (adminEmailSetting?.value as string) || process.env.ADMIN_ALERT_EMAIL || 'info@myukchef.com';
-
-        sendAdminOrderAlert(adminEmail, newOrder).catch((err: any) => console.error("Admin alert failed:", err));
-
-        // 3. In-App Notification for Admin (userId null or special admin room)
-        const admins = await db.select().from(users).where(eq(users.role, 'admin'));
-        for (const admin of admins) {
-            await db.insert(notifications).values({
-                userId: admin.id,
-                type: 'admin_alert',
-                title: 'New Order Received!',
-                message: `Order #${newOrder.id} just came in for £${newOrder.total.toFixed(2)}`,
-                link: `/admin/orders`
-            }).catch((err: any) => console.error("Admin notification failed:", err));
-        }
-
-        for (const admin of admins) sendPush(admin.id, { title: 'New order', body: `Order #${newOrder.id}: £${newOrder.total.toFixed(2)}`, url: '/admin/orders' }).catch(() => {});
-
-        // 4. SMS to Customer
-        const [smsSenderSetting] = await db.select().from(siteSettings).where(eq(siteSettings.key, 'sms_sender')).limit(1);
-        const smsSender = smsSenderSetting?.value || 'MYUKCHEF';
-
-        if (deliveryAddress.phone) {
-            const smsMessage = `${smsSender}: Order #${newOrder.id} received! Sum: £${newOrder.total.toFixed(2)}. We'll start preparing it shortly.`;
-            sendSMS(deliveryAddress.phone, smsMessage).catch((err: any) => console.error("Order placement SMS failed:", err));
-        }
-
+        await announceNewOrder(newOrder.id);
         res.status(201).json(newOrder);
     } catch (error: any) {
         if (error.status) return res.status(error.status).json({ error: error.message });

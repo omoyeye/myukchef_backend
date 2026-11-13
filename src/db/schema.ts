@@ -172,6 +172,12 @@ export const orders = mysqlTable("orders", {
     courierUpdatedAt: timestamp("courier_updated_at"),
     // Lets guests open their own tracking page without an account.
     trackingToken: varchar("tracking_token", { length: 64 }),
+    // not_required (card payments not switched on) | awaiting | paid | refunded | failed
+    paymentStatus: varchar("payment_status", { length: 20 }).default("not_required").notNull(),
+    stripeSessionId: varchar("stripe_session_id", { length: 255 }),
+    stripePaymentIntentId: varchar("stripe_payment_intent_id", { length: 255 }),
+    paidAt: timestamp("paid_at"),
+    refundedAt: timestamp("refunded_at"),
     createdAt: timestamp("created_at").defaultNow().notNull(),
 });
 
@@ -304,6 +310,15 @@ export const siteSettings = mysqlTable("site_settings", {
     id: int("id").autoincrement().primaryKey(),
     key: varchar("key", { length: 255 }).notNull().unique(), // e.g. 'store_info', 'operational_status', 'delivery_config', 'loyalty_config'
     value: json("value").notNull(),
+    updatedAt: timestamp("updated_at").defaultNow().notNull(),
+});
+
+// Keys for outside services (Stripe, Brevo) that Super Admins manage. Values are encrypted.
+export const integrationSettings = mysqlTable("integration_settings", {
+    id: int("id").autoincrement().primaryKey(),
+    provider: varchar("provider", { length: 32 }).notNull().unique(),
+    value: text("value").notNull(),
+    updatedBy: int("updated_by").references(() => users.id, { onDelete: "set null" }),
     updatedAt: timestamp("updated_at").defaultNow().notNull(),
 });
 

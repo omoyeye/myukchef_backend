@@ -1,3 +1,4 @@
+import { getBrevo } from "./integrations";
 const BREVO_EMAIL_URL = "https://api.brevo.com/v3/smtp/email";
 const SEND_TIMEOUT_MS = 10_000;
 
@@ -11,16 +12,17 @@ interface EmailMessage {
 
 /** Sends one email through Brevo's API. Callers decide what a failure means, so this throws. */
 async function sendEmail({ senderName, to, subject, html, replyTo }: EmailMessage) {
-    const apiKey = process.env.BREVO_API_KEY;
+    // Keys come from the admin area (Payments and messaging), or the server settings.
+    const { apiKey, senderEmail } = await getBrevo();
     if (!apiKey) {
-        console.warn(`BREVO_API_KEY not set. Email skipped: ${subject}`);
+        console.warn(`No Brevo API key set. Email skipped: ${subject}`);
         return;
     }
     const response = await fetch(BREVO_EMAIL_URL, {
         method: "POST",
         headers: { accept: "application/json", "content-type": "application/json", "api-key": apiKey },
         body: JSON.stringify({
-            sender: { name: senderName, email: MAIL_FROM },
+            sender: { name: senderName, email: senderEmail },
             to: [{ email: to }],
             subject,
             htmlContent: html,
@@ -38,8 +40,6 @@ const escapeHtml = (text: unknown) => String(text ?? "").replace(/&/g, "&amp;").
 
 const BRAND_NAME = "MYUKCHEF";
 const SITE_URL = (process.env.SITE_URL || 'https://myukchef.com').replace(/\/$/, '');
-const MAIL_FROM = process.env.MAIL_FROM || 'info@myukchef.com';
-const SUPPORT_INBOX = process.env.SUPPORT_EMAIL || 'info@myukchef.com';
 const LOGO_URL = `${SITE_URL}/logo.png`;
 
 export const sendWelcomeEmail = async (to: string, name: string) => {
@@ -217,7 +217,7 @@ export const sendSupportRequestEmail = async (data: { name: string; email: strin
     return sendEmail({
         senderName: `${BRAND_NAME} Support`,
         replyTo: data.email,
-        to: SUPPORT_INBOX,
+        to: (await getBrevo()).supportEmail,
         subject: `Support Request from ${data.name}`,
         html,
     });
