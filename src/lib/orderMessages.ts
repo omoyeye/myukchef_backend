@@ -1,4 +1,5 @@
 import { and, asc, eq, inArray } from "drizzle-orm";
+import { withTemplate } from "./templates";
 import { db } from "../db";
 import { chefs, orderMessages, orders } from "../db/schema";
 import { redactContactDetails } from "./contactGuard";
@@ -60,10 +61,10 @@ export async function postMessage(orderId: number, viewer: Viewer, chefIdInput: 
     const [{ id }] = await db.insert(orderMessages).values({ orderId, chefId: threadChef, senderId: viewer.userId || null, senderRole: role, body }).$returningId();
     const preview = body.length > 120 ? `${body.slice(0, 117)}...` : body;
     if (role === "customer") {
-        await notifyChef(threadChef, `Message about order #${orderId}`, preview, `/chef/dashboard?tab=orders&order=${orderId}`, "message");
+        await withTemplate("message.order_to_chef", { orderId, preview }, () => notifyChef(threadChef, `Message about order #${orderId}`, preview, `/chef/dashboard?tab=orders&order=${orderId}`, "message"));
     } else if (order.userId) {
         const name = progress.find((p) => p.chefId === threadChef)?.chefName ?? "Your chef";
-        await notify(order.userId, `${name} sent a message about order #${orderId}`, preview, `/order-tracker/${orderId}`, "message");
+        await withTemplate("message.order_to_customer", { orderId, chefName: name, preview }, () => notify(order.userId!, `${name} sent a message about order #${orderId}`, preview, `/order-tracker/${orderId}`, "message"));
     }
     return { id, from: role, body, createdAt: new Date(), chefId: threadChef };
 }

@@ -1,4 +1,5 @@
 import { and, desc, eq, inArray, isNull, lt, sql } from "drizzle-orm";
+import { withTemplate } from "./templates";
 import { db } from "../db";
 import { chefCompliance, chefInvoices, chefs, eventQuotes, events, orderChefProgress, orders, siteSettings, users } from "../db/schema";
 import { getStripe } from "./integrations";
@@ -107,12 +108,12 @@ async function createInvoice(input: {
     }
     const [invoice] = await db.select().from(chefInvoices).where(eq(chefInvoices.sourceKey, input.sourceKey)).limit(1);
     if (invoice && invoice.number.startsWith("INV") && invoice.status === "awaiting_chef" && !existing) {
-        await notifyChef(
+        await withTemplate("payout.invoice_ready", { invoiceNumber: invoice.number, description: input.description, amount: net.toFixed(2), percent: input.percent, tip: tip ? tip.toFixed(2) : "" }, () => notifyChef(
             input.chefId,
             `Invoice ${invoice.number} is ready`,
             `${input.description}: £${net.toFixed(2)} after MYUKCHEF's ${input.percent}% commission${tip ? `, including a £${tip.toFixed(2)} tip` : ""}. Please check and submit it so we can pay you.`,
             "/chef/dashboard?tab=payouts",
-        );
+        ));
     }
     return invoice;
 }
@@ -162,7 +163,7 @@ export async function submitInvoice(invoiceId: number, chefId: number, body: { c
     const name = typeof body.name === "string" ? body.name.trim().slice(0, 150) : "";
     if (name.length < 2) throw fail(400, "Type your full name to submit the invoice.");
     await db.update(chefInvoices).set({ status: "submitted", submittedAt: new Date(), submittedName: name, payoutError: null }).where(eq(chefInvoices.id, invoice.id));
-    await notifyAdmins(`Invoice ${invoice.number} submitted`, `${invoice.chefDetails?.displayName ?? "A chef"} submitted ${invoice.number} for £${invoice.netAmount.toFixed(2)}.`, "/admin/orders?tab=payouts");
+    await withTemplate("admin.invoice_submitted", { chefName: invoice.chefDetails?.displayName ?? "A chef", invoiceNumber: invoice.number, amount: invoice.netAmount.toFixed(2) }, () => notifyAdmins(`Invoice ${invoice.number} submitted`, `${invoice.chefDetails?.displayName ?? "A chef"} submitted ${invoice.number} for £${invoice.netAmount.toFixed(2)}.`, "/admin/orders?tab=payouts"));
     return payInvoiceAutomatically(invoice.id);
 }
 
@@ -179,7 +180,7 @@ export async function payInvoiceAutomatically(invoiceId: number) {
 
     const waitForBank = async (reason: string) => {
         await db.update(chefInvoices).set({ status: "submitted", payoutError: reason }).where(eq(chefInvoices.id, invoice.id));
-        await notifyAdmins(`Pay ${invoice.chefDetails?.displayName ?? "a chef"} by bank transfer`, `${invoice.number}, £${invoice.netAmount.toFixed(2)}: ${reason}`, "/admin/orders?tab=payouts");
+        await withTemplate("admin.pay_by_bank", { chefName: invoice.chefDetails?.displayName ?? "a chef", invoiceNumber: invoice.number, amount: invoice.netAmount.toFixed(2), reason }, () => notifyAdmins(`Pay ${invoice.chefDetails?.displayName ?? "a chef"} by bank transfer`, `${invoice.number}, £${invoice.netAmount.toFixed(2)}: ${reason}`, "/admin/orders?tab=payouts"));
         const [fresh] = await db.select().from(chefInvoices).where(eq(chefInvoices.id, invoice.id)).limit(1);
         return fresh;
     };
@@ -234,7 +235,7 @@ export async function markInvoicePaid(invoiceId: number, opts: { method: "stripe
     if (invoice.quoteId) await db.update(eventQuotes).set({ payoutStatus: "paid", payoutPaidAt: new Date() }).where(eq(eventQuotes.id, invoice.quoteId));
 
     const how = opts.method === "stripe" ? "to your Stripe account" : "by bank transfer";
-    await notifyChef(invoice.chefId, `You've been paid £${invoice.netAmount.toFixed(2)}`, `MYUKCHEF has paid ${invoice.number} ${how}. Your receipt is ready.`, `/chef/receipts/${invoice.id}`);
+    await withTemplate("payout.paid", { amount: invoice.netAmount.toFixed(2), invoiceNumber: invoice.number, method: how }, () => notifyChef(invoice.chefId, `You've been paid £${invoice.netAmount.toFixed(2)}`, `MYUKCHEF has paid ${invoice.number} ${how}. Your receipt is ready.`, `/chef/receipts/${invoice.id}`));
     // notifyChef sends it in the app, as a push notification and by email.
     const [paid] = await db.select().from(chefInvoices).where(eq(chefInvoices.id, invoice.id)).limit(1);
     return paid;
@@ -249,7 +250,7 @@ export async function holdInvoice(invoiceId: number, reason: unknown) {
         .where(and(eq(chefInvoices.id, invoiceId), inArray(chefInvoices.status, ["awaiting_chef", "submitted"])));
     if (!(result as unknown as { affectedRows?: number }).affectedRows) throw fail(400, "Only unpaid invoices can be put on hold.");
     const [invoice] = await db.select().from(chefInvoices).where(eq(chefInvoices.id, invoiceId)).limit(1);
-    await notifyChef(invoice!.chefId, `Payout for ${invoice!.number} on hold`, note, "/chef/dashboard?tab=payouts");
+    await withTemplate("payout.held", { invoiceNumber: invoice!.number, reason: note }, () => notifyChef(invoice!.chefId, `Payout for ${invoice!.number} on hold`, note, "/chef/dashboard?tab=payouts"));
     return invoice!;
 }
 
@@ -258,7 +259,7 @@ export async function releaseInvoice(invoiceId: number) {
     if (!invoice || invoice.status !== "held") throw fail(400, "Only held invoices can be released.");
     const next = invoice.submittedAt ? "submitted" : "awaiting_chef";
     await db.update(chefInvoices).set({ status: next, holdReason: null }).where(eq(chefInvoices.id, invoice.id));
-    await notifyChef(invoice.chefId, `Payout for ${invoice.number} released`, next === "submitted" ? "It's on its way to being paid." : "Please check and submit your invoice.", "/chef/dashboard?tab=payouts");
+    await withTemplate("payout.released", { invoiceNumber: invoice.number }, () => notifyChef(invoice.chefId, `Payout for ${invoice.number} released`, next === "submitted" ? "It's on its way to being paid." : "Please check and submit your invoice.", "/chef/dashboard?tab=payouts"));
     return next === "submitted" ? payInvoiceAutomatically(invoice.id) : (await db.select().from(chefInvoices).where(eq(chefInvoices.id, invoice.id)).limit(1))[0];
 }
 
@@ -267,7 +268,7 @@ export async function voidOrderInvoices(orderId: number, reason: string) {
     const open = await db.select().from(chefInvoices).where(and(eq(chefInvoices.orderId, orderId), inArray(chefInvoices.status, ["awaiting_chef", "submitted", "held"])));
     for (const invoice of open) {
         await db.update(chefInvoices).set({ status: "void", holdReason: reason }).where(eq(chefInvoices.id, invoice.id));
-        await notifyChef(invoice.chefId, `${invoice.number} cancelled`, reason, "/chef/dashboard?tab=payouts");
+        await withTemplate("payout.cancelled", { invoiceNumber: invoice.number, reason }, () => notifyChef(invoice.chefId, `${invoice.number} cancelled`, reason, "/chef/dashboard?tab=payouts"));
     }
     return open.length;
 }

@@ -4,6 +4,7 @@ import { siteSettings, users } from "../db/schema";
 import { eq } from "drizzle-orm";
 import { getUserId, isAdmin, requireAdmin } from "../lib/auth";
 import { cleanTiers } from "../lib/pricing";
+import { forgetBrand } from "../lib/mail";
 
 const router = Router();
 
@@ -35,6 +36,9 @@ router.post("/", requireAdmin, async (req, res) => {
     if (key === "delivery_config" && value && typeof value === "object") value = { ...value, tiers: cleanTiers(value.tiers) };
     // Payout rules and keys have their own checked endpoints.
     if (key === "chef_commission") return res.status(400).json({ error: "Change the chef commission under Orders, Chef payouts." });
+
+    // Emails carry the logo, phone, address and socials, so they pick up changes straight away.
+    if (["store_info", "footer_info", "company_info"].includes(key)) forgetBrand();
 
     if (!key || value === undefined) {
         return res.status(400).json({ error: "Key and value are required" });

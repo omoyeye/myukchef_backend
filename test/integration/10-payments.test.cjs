@@ -10,7 +10,7 @@ const API = process.env.TEST_API;
 let pass = 0, fail = 0;
 const ok = (cond, label, extra) => { if (cond) pass++; else { fail++; console.log("FAIL:", label, extra !== undefined ? JSON.stringify(extra).slice(0, 300) : ""); } };
 const call = async (method, p, body, token, headers = {}) => {
-    const res = await fetch(API + p, { method, headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}), ...headers }, body: body == null ? undefined : typeof body === "string" ? body : JSON.stringify(body) });
+    const res = await fetch(API + p, { signal: AbortSignal.timeout(60_000), method, headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}), ...headers }, body: body == null ? undefined : typeof body === "string" ? body : JSON.stringify(body) });
     return { status: res.status, data: await res.json().catch(() => null) };
 };
 const FAKE_SK = "sk_test_" + "A".repeat(40);

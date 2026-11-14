@@ -2,8 +2,9 @@ import { and, eq, sql } from "drizzle-orm";
 import { db } from "../db";
 import { chefProducts, notifications, orderItems, orders, products, siteSettings, users } from "../db/schema";
 import { allergenName } from "./allergens";
-import { sendAdminOrderAlert, sendOrderConfirmationEmail } from "./mail";
-import { notifyChef } from "./notify";
+import { orderPlacedVars, sendAdminOrderAlert, sendOrderConfirmationEmail } from "./mail";
+import { resolveContent, withTemplate } from "./templates";
+import { notifyAdmins, notifyChef } from "./notify";
 import { progressForOrder } from "./orderProgress";
 import { checkoutOutcome, type PaymentOutcome } from "./payments";
 import { sendPush } from "./push";
@@ -41,36 +42,27 @@ export async function announceNewOrder(orderId: number) {
     // Each chef whose dishes are in the order.
     for (const chefId of new Set(lines.map((l) => l.chefId).filter((id): id is number => id != null))) {
         const mine = lines.filter((l) => l.chefId === chefId);
-        await notifyChef(chefId, `New order #${order.id}`, `${mine.map((l) => `${l.quantity} x ${l.name}`).join(", ")}. Move it to "Cooking" when you start, so the customer knows.`, "/chef/dashboard?tab=orders");
+        await withTemplate("order.new_for_chef", { orderId: order.id, items: mine.map((l) => `${l.quantity} x ${l.name}`).join(", ") }, () => notifyChef(chefId, `New order #${order.id}`, `${mine.map((l) => `${l.quantity} x ${l.name}`).join(", ")}. Move it to "Cooking" when you start, so the customer knows.`, "/chef/dashboard?tab=orders"));
     }
 
     const address = (order.deliveryAddress ?? {}) as { email?: string; phone?: string };
     const [orderUser] = order.userId ? await db.select().from(users).where(eq(users.id, order.userId)).limit(1) : [];
     const customerEmail = address.email || orderUser?.email;
-    if (customerEmail) sendOrderConfirmationEmail(customerEmail, order, lines).catch((err: Error) => console.error("Customer email failed:", err.message));
+    const firstName = ((address as { firstName?: string }).firstName || orderUser?.name || "").split(" ")[0] ?? "";
+    if (customerEmail) sendOrderConfirmationEmail(customerEmail, order, lines, firstName).catch((err: Error) => console.error("Customer email failed:", err.message));
 
     const [adminEmailSetting] = await db.select().from(siteSettings).where(eq(siteSettings.key, "admin_alert_email")).limit(1);
     const adminEmail = (adminEmailSetting?.value as string) || process.env.ADMIN_ALERT_EMAIL || "info@myukchef.com";
     sendAdminOrderAlert(adminEmail, order).catch((err: Error) => console.error("Admin alert failed:", err.message));
 
     const paid = order.paymentStatus === "paid" ? " (paid by card)" : "";
-    const admins = await db.select({ id: users.id }).from(users).where(eq(users.role, "admin"));
-    for (const admin of admins) {
-        await db.insert(notifications).values({
-            userId: admin.id,
-            type: "admin_alert",
-            title: "New Order Received!",
-            message: `Order #${order.id} just came in for £${order.total.toFixed(2)}${paid}`,
-            link: "/admin/orders",
-        }).catch((err: Error) => console.error("Admin notification failed:", err.message));
-        sendPush(admin.id, { title: "New order", body: `Order #${order.id}: £${order.total.toFixed(2)}${paid}`, url: "/admin/orders" }).catch(() => {});
-    }
+    await withTemplate("admin.new_order", { orderId: order.id, total: order.total.toFixed(2), paid }, () =>
+        notifyAdmins("New Order Received!", `Order #${order.id} just came in for £${order.total.toFixed(2)}${paid}`, "/admin/orders"));
 
+    // The text message, worded by the order confirmation template.
     if (address.phone) {
-        const [smsSenderSetting] = await db.select().from(siteSettings).where(eq(siteSettings.key, "sms_sender")).limit(1);
-        const smsSender = (smsSenderSetting?.value as string) || "MYUKCHEF";
-        sendSMS(address.phone, `${smsSender}: Order #${order.id} received! Sum: £${order.total.toFixed(2)}. We'll start preparing it shortly.`)
-            .catch((err: Error) => console.error("Order placement SMS failed:", err.message));
+        const sms = await resolveContent("order.placed", orderPlacedVars(order, lines, firstName));
+        if (sms.channels.sms) sendSMS(address.phone, sms.sms).catch((err: Error) => console.error("Order placement SMS failed:", err.message));
     }
 }
 

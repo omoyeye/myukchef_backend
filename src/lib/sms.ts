@@ -22,6 +22,8 @@ export async function sendSMS(to: string, text: string) {
     try {
         const response = await fetch("https://api.brevo.com/v3/transactionalSMS/sms", {
             method: "POST",
+            // A slow outside service must never hold anything up.
+            signal: AbortSignal.timeout(10_000),
             headers: {
                 "accept": "application/json",
                 "content-type": "application/json",

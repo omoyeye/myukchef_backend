@@ -65,7 +65,7 @@ export async function sendPush(userId: number, notice: { title: string; body: st
             await sendNotification(
                 { endpoint: device.endpoint, keys: { p256dh: device.p256dh, auth: device.auth } },
                 JSON.stringify(notice),
-                { TTL: 60 * 60 * 24 },
+                { TTL: 60 * 60 * 24, timeout: 10_000 },
             );
         } catch (error) {
             const status = (error as { statusCode?: number }).statusCode;

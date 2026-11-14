@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { withTemplate } from "../lib/templates";
 import { and, desc, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
 import { chefProducts, chefReviews, chefs, eventQuotes, events, mealPlans, mealPlanWeeks, orderItems, orders, products, users } from "../db/schema";
@@ -131,7 +132,7 @@ router.put("/chef/:chefId", requireAuth, rateLimit(20, 60_000), async (req, res)
         await db.update(chefReviews).set({ ...values, updatedAt: new Date() }).where(eq(chefReviews.id, existing.id));
     } else {
         await db.insert(chefReviews).values({ ...values, userId, chefId });
-        await notifyChef(chefId, "You have a new review", `A customer gave you ${rating} out of 5 stars.`);
+        await withTemplate("chef.new_review", { rating }, () => notifyChef(chefId, "You have a new review", `A customer gave you ${rating} out of 5 stars.`));
     }
     const [saved] = await db.select().from(chefReviews).where(and(eq(chefReviews.userId, userId), eq(chefReviews.chefId, chefId))).limit(1);
     res.status(existing ? 200 : 201).json(saved);
@@ -162,7 +163,7 @@ router.post("/:id/reply", requireAuth, rateLimit(20, 60_000), async (req, res) =
     const reply = String(req.body.reply ?? "").trim().slice(0, 500);
     assertNoContactDetails(reply);
     await db.update(chefReviews).set({ chefReply: reply || null, chefRepliedAt: reply ? new Date() : null }).where(eq(chefReviews.id, review.id));
-    if (reply) await notify(review.userId, "Your chef replied to your review", reply.slice(0, 120), `/chefs/${chef.id}`);
+    if (reply) await withTemplate("review.chef_replied", { reply: reply.slice(0, 120) }, () => notify(review.userId, "Your chef replied to your review", reply.slice(0, 120), `/chefs/${chef.id}`));
     res.json({ chefReply: reply || null });
 });
 

@@ -1,4 +1,5 @@
 import { and, eq, inArray, lt, lte, sql } from "drizzle-orm";
+import { withTemplate } from "./templates";
 import { db } from "../db";
 import { chefProducts, chefs, mealPlans, mealPlanWeeks, PlanDish, siteSettings, users } from "../db/schema";
 import { notify } from "./notify";
@@ -121,7 +122,7 @@ export async function completeIfFinished(planId: number) {
     const [plan] = await db.select().from(mealPlans).where(eq(mealPlans.id, planId)).limit(1);
     if (!plan || !["active", "paused"].includes(plan.status)) return false;
     await db.update(mealPlans).set({ status: "completed", pausedUntil: null }).where(eq(mealPlans.id, planId));
-    await notify(plan.userId, "Your meal plan has finished", "Hope you enjoyed it. You can renew it with your chef in one tap, and tell others how it went.", `/my-plans/${planId}`);
+    await withTemplate("plan.finished", {}, () => notify(plan.userId, "Your meal plan has finished", "Hope you enjoyed it. You can renew it with your chef in one tap, and tell others how it went.", `/my-plans/${planId}`));
     return true;
 }
 
@@ -146,14 +147,14 @@ export async function runMealPlanJobs() {
     for (const plan of stale) {
         await db.update(mealPlans).set({ status: "expired" }).where(eq(mealPlans.id, plan.id));
         await db.update(mealPlanWeeks).set({ status: "cancelled" }).where(eq(mealPlanWeeks.planId, plan.id));
-        await notify(plan.userId, "Your meal plan request expired", "The chef didn't reply before your start date, so nothing went ahead. You can try a new date or another chef.", `/my-plans/${plan.id}`);
+        await withTemplate("plan.request_expired", {}, () => notify(plan.userId, "Your meal plan request expired", "The chef didn't reply before your start date, so nothing went ahead. You can try a new date or another chef.", `/my-plans/${plan.id}`));
     }
 
     // Pauses that have run their course.
     const resuming = await db.select().from(mealPlans).where(and(eq(mealPlans.status, "paused"), lte(mealPlans.pausedUntil, now)));
     for (const plan of resuming) {
         await resumePlan(plan, cutoffHours);
-        await notify(plan.userId, "Your meal plan is back on", "Your pause has ended and your deliveries have restarted.", `/my-plans/${plan.id}`);
+        await withTemplate("plan.resumed", {}, () => notify(plan.userId, "Your meal plan is back on", "Your pause has ended and your deliveries have restarted.", `/my-plans/${plan.id}`));
     }
 
     // Deliveries nobody closed a week after their date, so a plan can't stay open forever.
@@ -179,7 +180,7 @@ export async function runMealPlanJobs() {
     for (const { week, userId } of closing) {
         await db.update(mealPlanWeeks).set({ lockReminderSent: true }).where(eq(mealPlanWeeks.id, week.id));
         if (isLocked(week.deliveryDate, cutoffHours)) continue;
-        await notify(userId, `Week ${week.weekNumber}: your menu closes soon`, "Change your dishes or skip this delivery before the chef starts shopping.", `/my-plans/${week.planId}`);
+        await withTemplate("plan.menu_closing", { week: week.weekNumber }, () => notify(userId, `Week ${week.weekNumber}: your menu closes soon`, "Change your dishes or skip this delivery before the chef starts shopping.", `/my-plans/${week.planId}`));
     }
 
     // Plans never renew on their own, so customers get a clear nudge instead.
@@ -190,7 +191,7 @@ export async function runMealPlanJobs() {
     ));
     for (const plan of ending) {
         await db.update(mealPlans).set({ endingReminderSent: true }).where(eq(mealPlans.id, plan.id));
-        await notify(plan.userId, "Your meal plan ends soon", `Your plan finishes on ${plan.endDate}. It won't renew by itself, so renew it if you'd like to carry on.`, `/my-plans/${plan.id}`);
+        await withTemplate("plan.ending_soon", { endDate: plan.endDate }, () => notify(plan.userId, "Your meal plan ends soon", `Your plan finishes on ${plan.endDate}. It won't renew by itself, so renew it if you'd like to carry on.`, `/my-plans/${plan.id}`));
     }
 }
 

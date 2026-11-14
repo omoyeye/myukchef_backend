@@ -1,14 +1,13 @@
 import { and, eq, inArray, sql } from "drizzle-orm";
+import { withTemplate } from "./templates";
 import { db } from "../db";
 import { chefProducts, chefs, orderChefProgress, orderItems, orders, products, users } from "../db/schema";
 import { redactContactDetails } from "./contactGuard";
-import { sendNotificationEmail } from "./mail";
-import { notify, notifyAdmins, notifyChef } from "./notify";
+import { notify, notifyAdmins, notifyChef, notifyGuest } from "./notify";
 import { getPayoutRules, raiseOrderInvoice, splitPayout, voidOrderInvoices } from "./chefPayouts";
 import { refundOrder } from "./payments";
 import { rewardReferral } from "./accounts";
 import { getOrderSettings } from "./pricing";
-import { sendSMS } from "./sms";
 
 /**
  * How a one-off order moves through each chef's kitchen. Chefs move their own part forward one
@@ -102,15 +101,14 @@ export const overallStage = (progress: ChefProgress[], fallback: string): string
 /** Tells the customer, signed in or not, by every channel they have. */
 export async function notifyCustomer(order: OrderRow, title: string, message: string, extraQuery = "") {
     const address = (order.deliveryAddress ?? {}) as { email?: string; phone?: string };
+    // Which channels go (including a text to the phone on the order) is set by the message's template.
     if (order.userId) {
-        await notify(order.userId, title, message, `/order-tracker/${order.id}${extraQuery ? `?${extraQuery}` : ""}`, "status_update");
-    } else if (address.email) {
+        await notify(order.userId, title, message, `/order-tracker/${order.id}${extraQuery ? `?${extraQuery}` : ""}`, "status_update", { phone: address.phone });
+    } else {
         // Guests have no bell or app, so their email carries the private tracking link.
         const query = [order.trackingToken ? `t=${order.trackingToken}` : "", extraQuery].filter(Boolean).join("&");
-        const link = `/order-tracker/${order.id}${query ? `?${query}` : ""}`;
-        sendNotificationEmail(address.email, title, message, link).catch((e: Error) => console.error("Guest status email failed:", e.message));
+        await notifyGuest(address, title, message, `/order-tracker/${order.id}${query ? `?${query}` : ""}`);
     }
-    if (address.phone) sendSMS(address.phone, `MYUKCHEF: ${message}`).catch((e: Error) => console.error("Status SMS failed:", e.message));
 }
 
 /** What changes for the whole order when its stage changes. */
@@ -210,19 +208,19 @@ export async function moveChefStage(orderId: number, chefId: number, next: unkno
     const othersBehind = progress.some((p) => p.chefId !== chefId && rank(p.status) < rank(next));
     if (delivered) {
         // The customer is asked to confirm, and the Super Admin is told so the chef can be paid.
-        await notifyCustomer(
+        await withTemplate(pickup ? "order.collected" : "order.delivered", { orderId: order.id, chefName: mine.chefName }, () => notifyCustomer(
             order,
             copy.title,
             `${copy.message} Please confirm you received it, or tell us if something's wrong.`,
             "confirm=1",
-        );
-        await notifyAdmins(
+        ));
+        await withTemplate("admin.order_delivered", { orderId: order.id, chefName: mine.chefName, amount: (payoutAmount ?? 0).toFixed(2) }, () => notifyAdmins(
             `${mine.chefName} delivered order #${order.id}`,
             `The customer has been asked to confirm. ${mine.chefName}'s invoice for £${(payoutAmount ?? 0).toFixed(2)} follows once they do.`,
             "/admin/orders?tab=payouts",
-        );
+        ));
     } else {
-        await notifyCustomer(order, copy.title, othersBehind ? `${copy.message} The rest of your order is still with its other chefs.` : copy.message);
+        await withTemplate(next === "preparing" ? "order.cooking" : pickup ? "order.ready_to_collect" : "order.on_the_way", { orderId: order.id, chefName: mine.chefName, othersNote: othersBehind ? " The rest of your order is still with its other chefs." : "" }, () => notifyCustomer(order, copy.title, othersBehind ? `${copy.message} The rest of your order is still with its other chefs.` : copy.message));
     }
 
     return { status: next, orderStatus: overall, progress };
@@ -250,19 +248,19 @@ export async function confirmDelivery(orderId: number, viewer: { userId: number 
             .where(and(eq(orderChefProgress.orderId, order.id), eq(orderChefProgress.chefId, part.chefId)));
         // Confirmed: the chef's invoice is raised for them to check and submit.
         if (received && part.progressId) await raiseOrderInvoice(part.progressId).catch((e) => console.error("Invoice failed:", e));
-        await notifyChef(
+        await withTemplate(received ? "order.confirmed_chef" : "order.problem_chef", { orderId: order.id }, () => notifyChef(
             part.chefId,
             received ? `Order #${order.id} confirmed` : `Problem reported on order #${order.id}`,
             received ? "The customer confirmed they received your food. Your invoice is ready to submit." : "The customer reported a problem. Our team will be in touch before you're paid.",
             "/chef/dashboard?tab=orders",
-        );
+        ));
     }
     const chefsNamed = delivered.map((p) => p.chefName).join(", ");
-    await notifyAdmins(
+    await withTemplate(received ? "admin.order_confirmed" : "admin.order_problem", { orderId: order.id, chefNames: chefsNamed, issue: received ? "" : redactContactDetails(note) ?? "" }, () => notifyAdmins(
         received ? `Order #${order.id} delivery confirmed` : `Problem reported on order #${order.id}`,
         received ? `The customer confirmed they received their food from ${chefsNamed}.` : `From ${chefsNamed}: ${redactContactDetails(note)}`,
         "/admin/orders?tab=payouts",
-    );
+    ));
     return { confirmed: delivered.length };
 }
 
@@ -320,13 +318,13 @@ export async function cancelOrder(order: OrderRow, by: "customer" | "admin") {
     // Chefs never saw an unpaid order, so there's nothing to tell them.
     if (order.status !== "awaiting_payment") {
         for (const p of await progressForOrder(order)) {
-            await notifyChef(p.chefId, `Order #${order.id} was cancelled`, by === "customer" ? "The customer cancelled before you started. You don't need to prepare it." : "You no longer need to prepare this order.", "/chef/dashboard?tab=orders");
+            await withTemplate("order.cancelled_chef", { orderId: order.id, cancelledBy: by === "customer" ? "the customer" : "MYUKCHEF" }, () => notifyChef(p.chefId, `Order #${order.id} was cancelled`, by === "customer" ? "The customer cancelled before you started. You don't need to prepare it." : "You no longer need to prepare this order.", "/chef/dashboard?tab=orders"));
         }
-        if (by === "customer") await notifyAdmins(`Order #${order.id} cancelled by the customer`, refunded ? `£${order.total.toFixed(2)} was refunded to their card.` : "No payment had been taken.", "/admin/orders");
+        if (by === "customer") await withTemplate("admin.order_cancelled_by_customer", { orderId: order.id, total: order.total.toFixed(2) }, () => notifyAdmins(`Order #${order.id} cancelled by the customer`, refunded ? `£${order.total.toFixed(2)} was refunded to their card.` : "No payment had been taken.", "/admin/orders"));
     }
-    await notifyCustomer(order, `Order #${order.id} cancelled`, refunded
+    await withTemplate(refunded ? "order.cancelled_refunded" : "order.cancelled", { orderId: order.id, total: order.total.toFixed(2) }, () => notifyCustomer(order, `Order #${order.id} cancelled`, refunded
         ? `Your order #${order.id} has been cancelled and your payment of £${order.total.toFixed(2)} refunded to your card. It can take 5 to 10 days to show.`
-        : `Your order #${order.id} has been cancelled.${by === "admin" ? " Contact us if you have any questions." : ""}`);
+        : `Your order #${order.id} has been cancelled.${by === "admin" ? " Contact us if you have any questions." : ""}`));
     const [updated] = await db.select().from(orders).where(eq(orders.id, order.id)).limit(1);
     return updated!;
 }
@@ -345,9 +343,9 @@ export async function adminSetOrderStatus(orderId: number, status: unknown) {
         await db.update(orderChefProgress).set({ status: "received", updatedAt: new Date() }).where(eq(orderChefProgress.orderId, order.id));
         await orderStageChanged(order, "received");
         for (const p of await progressForOrder({ ...order, status: "received" })) {
-            await notifyChef(p.chefId, `Order #${order.id} is back on`, "This order was reopened. Please prepare it again.", "/chef/dashboard?tab=orders");
+            await withTemplate("order.reopened_chef", { orderId: order.id }, () => notifyChef(p.chefId, `Order #${order.id} is back on`, "This order was reopened. Please prepare it again.", "/chef/dashboard?tab=orders"));
         }
-        await notifyCustomer(order, `Order #${order.id} reopened`, `Your order #${order.id} is back on. Your chef will start it soon.`);
+        await withTemplate("order.reopened", { orderId: order.id }, () => notifyCustomer(order, `Order #${order.id} reopened`, `Your order #${order.id} is back on. Your chef will start it soon.`));
     } else {
         throw Object.assign(new Error("Chefs move orders through their kitchens. Super Admins can cancel or reopen an order."), { status: 400 });
     }

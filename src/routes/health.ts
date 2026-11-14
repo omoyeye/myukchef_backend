@@ -1,4 +1,5 @@
 import fs from "fs";
+import { withTemplate } from "../lib/templates";
 import path from "path";
 import { Router } from "express";
 import { sql } from "drizzle-orm";
@@ -41,7 +42,7 @@ function record(source: ErrorReport["source"], message: string, where: string) {
     if (Date.now() - (lastAlert.get(key) ?? 0) > ALERT_GAP_MS) {
         lastAlert.set(key, Date.now());
         if (lastAlert.size > 500) lastAlert.clear();
-        notifyAdmins(source === "server" ? "Something went wrong on the server" : "A customer hit an error", `${text.slice(0, 160)} (${place})`, "/admin/reports#health")
+        withTemplate("admin.error", { source, message: text.slice(0, 160), where: place }, () => notifyAdmins(source === "server" ? "Something went wrong on the server" : "A customer hit an error", `${text.slice(0, 160)} (${place})`, "/admin/reports#health"))
             .catch(() => undefined);
     }
 }

@@ -1,4 +1,5 @@
 import { Request, Router } from "express";
+import { withTemplate } from "../lib/templates";
 import { and, asc, desc, eq, gte, inArray, lte, ne } from "drizzle-orm";
 import { db } from "../db";
 import { chefReviews, chefs, mealPlanMessages, mealPlans, mealPlanWeeks, users } from "../db/schema";
@@ -168,8 +169,8 @@ async function createPlan(userId: number, input: Record<string, any>, renewedFro
         return id;
     });
 
-    await notifyChef(chef.id, "New meal plan request", `A customer would like a ${durationMonths} month plan: ${mealsPerWeek} meals a week for ${servings}. Please reply before ${input.startDate}.`);
-    await notify(userId, "We've sent your request", `${chef.displayName} will confirm your ${durationMonths} month plan. Nothing is charged yet.`, `/my-plans/${planId}`);
+    await withTemplate("plan.request_chef", { months: durationMonths, mealsPerWeek, servings, startDate: input.startDate }, () => notifyChef(chef.id, "New meal plan request", `A customer would like a ${durationMonths} month plan: ${mealsPerWeek} meals a week for ${servings}. Please reply before ${input.startDate}.`));
+    await withTemplate("plan.request_sent", { chefName: chef.displayName, months: durationMonths }, () => notify(userId, "We've sent your request", `${chef.displayName} will confirm your ${durationMonths} month plan. Nothing is charged yet.`, `/my-plans/${planId}`));
     const [plan] = await db.select().from(mealPlans).where(eq(mealPlans.id, planId)).limit(1);
     return plan;
 }
@@ -223,8 +224,8 @@ router.put("/admin/:id", requireAdmin, async (req, res) => {
         await db.update(mealPlanWeeks).set({ status: "cancelled" }).where(and(eq(mealPlanWeeks.planId, plan.id), inArray(mealPlanWeeks.status, ["scheduled", "paused"])));
     }
     if (status !== plan.status) {
-        await notify(plan.userId, "Your meal plan was updated", `Your plan's status is now: ${status}.`, `/my-plans/${plan.id}`);
-        await notifyChef(plan.chefId, "A meal plan was updated", `MYUKCHEF changed a plan's status to: ${status}. Check your cook sheet.`);
+        await withTemplate("plan.status_updated", { status }, () => notify(plan.userId, "Your meal plan was updated", `Your plan's status is now: ${status}.`, `/my-plans/${plan.id}`));
+        await withTemplate("plan.status_updated_chef", { status }, () => notifyChef(plan.chefId, "A meal plan was updated", `MYUKCHEF changed a plan's status to: ${status}. Check your cook sheet.`));
     }
     const [updated] = await db.select().from(mealPlans).where(eq(mealPlans.id, plan.id)).limit(1);
     res.json(updated);
@@ -336,11 +337,11 @@ router.patch("/:id/respond", requireAuth, async (req, res) => {
     if (req.body.action === "accept") {
         if (plan.startDate < today()) throw badRequest("The start date has already passed");
         await db.update(mealPlans).set({ status: "active", chefNote: note }).where(eq(mealPlans.id, plan.id));
-        await notify(plan.userId, "Your meal plan is confirmed", note || "Your chef has accepted your plan. You can now change, skip or pause any week before its cut-off.", `/my-plans/${plan.id}`);
+        await withTemplate("plan.confirmed", { note: note ?? "" }, () => notify(plan.userId, "Your meal plan is confirmed", note || "Your chef has accepted your plan. You can now change, skip or pause any week before its cut-off.", `/my-plans/${plan.id}`));
     } else if (req.body.action === "decline") {
         await db.update(mealPlans).set({ status: "declined", chefNote: note }).where(eq(mealPlans.id, plan.id));
         await db.update(mealPlanWeeks).set({ status: "cancelled" }).where(eq(mealPlanWeeks.planId, plan.id));
-        await notify(plan.userId, "Your chef can't take this plan", note || "They aren't able to take this plan right now. Nothing is owed, and you can try another chef.", `/my-plans/${plan.id}`);
+        await withTemplate("plan.declined", { note: note ?? "" }, () => notify(plan.userId, "Your chef can't take this plan", note || "They aren't able to take this plan right now. Nothing is owed, and you can try another chef.", `/my-plans/${plan.id}`));
     } else {
         throw badRequest("Please accept or decline the request");
     }
@@ -393,7 +394,7 @@ router.post("/:id/weeks/:weekId/skip", requireAuth, async (req, res) => {
     const week = await loadWeek(plan, req.params.weekId);
     await assertChangeable(plan, week);
     await db.update(mealPlanWeeks).set({ status: "skipped" }).where(eq(mealPlanWeeks.id, week.id));
-    await notifyChef(plan.chefId, "A delivery was skipped", `A customer skipped their week ${week.weekNumber} delivery on ${week.deliveryDate}.`);
+    await withTemplate("plan.week_skipped_chef", { week: week.weekNumber, date: week.deliveryDate }, () => notifyChef(plan.chefId, "A delivery was skipped", `A customer skipped their week ${week.weekNumber} delivery on ${week.deliveryDate}.`));
     await completeIfFinished(plan.id);
     res.json({ status: "skipped" });
 });
@@ -419,7 +420,7 @@ router.post("/:id/pause", requireAuth, async (req, res) => {
     const pausing = weeks.filter((w) => !isLocked(w.deliveryDate, cutoffHours));
     if (pausing.length > 0) await db.update(mealPlanWeeks).set({ status: "paused" }).where(inArray(mealPlanWeeks.id, pausing.map((w) => w.id)));
     await db.update(mealPlans).set({ status: "paused", pausedUntil: until }).where(eq(mealPlans.id, plan.id));
-    await notifyChef(plan.chefId, "A meal plan was paused", `A customer paused their plan until ${until}. ${pausing.length} deliveries are on hold.`);
+    await withTemplate("plan.paused_chef", { until, count: pausing.length }, () => notifyChef(plan.chefId, "A meal plan was paused", `A customer paused their plan until ${until}. ${pausing.length} deliveries are on hold.`));
     res.json({ status: "paused", pausedUntil: until, weeksPaused: pausing.length, stillComing: weeks.length - pausing.length });
 });
 
@@ -430,7 +431,7 @@ router.post("/:id/resume", requireAuth, async (req, res) => {
     if (plan.status !== "paused") throw badRequest("This plan isn't paused");
     const { cutoffHours } = await getPlanConfig();
     await resumePlan(plan, cutoffHours);
-    await notifyChef(plan.chefId, "A meal plan has restarted", "A customer has restarted their plan early. Check your cook sheet.");
+    await withTemplate("plan.restarted_chef", {}, () => notifyChef(plan.chefId, "A meal plan has restarted", "A customer has restarted their plan early. Check your cook sheet."));
     res.json({ status: "active" });
 });
 
@@ -446,7 +447,7 @@ router.post("/:id/cancel", requireAuth, async (req, res) => {
     const closing = weeks.filter((w) => !locked.includes(w));
     if (closing.length > 0) await db.update(mealPlanWeeks).set({ status: "cancelled" }).where(inArray(mealPlanWeeks.id, closing.map((w) => w.id)));
     await db.update(mealPlans).set({ status: "cancelled", pausedUntil: null, cancelReason: String(req.body.reason ?? "").trim().slice(0, 300) || null }).where(eq(mealPlans.id, plan.id));
-    await notifyChef(plan.chefId, "A meal plan was cancelled", locked.length > 0 ? `A customer cancelled their plan. ${locked.length} delivery past its cut-off still goes ahead.` : "A customer cancelled their plan. No further deliveries are due.");
+    await withTemplate("plan.cancelled_chef", { lockedCount: locked.length }, () => notifyChef(plan.chefId, "A meal plan was cancelled", locked.length > 0 ? `A customer cancelled their plan. ${locked.length} delivery past its cut-off still goes ahead.` : "A customer cancelled their plan. No further deliveries are due."));
     res.json({ status: "cancelled", stillComing: locked.map((w) => w.deliveryDate) });
 });
 
@@ -496,11 +497,11 @@ router.patch("/:id/weeks/:weekId/status", requireAuth, async (req, res) => {
     await db.update(mealPlanWeeks).set({ status }).where(eq(mealPlanWeeks.id, week.id));
     if (status === "delivered" && week.status !== "delivered") {
         await addPoints(plan.userId, week.total);
-        await notify(plan.userId, `Week ${week.weekNumber} has arrived`, "Enjoy! How was it? Rating your chef helps other customers choose.", `/my-plans/${plan.id}`);
+        await withTemplate("plan.week_delivered", { week: week.weekNumber }, () => notify(plan.userId, `Week ${week.weekNumber} has arrived`, "Enjoy! How was it? Rating your chef helps other customers choose.", `/my-plans/${plan.id}`));
     } else if (status === "out_for_delivery") {
-        await notify(plan.userId, `Week ${week.weekNumber} is on its way`, "Your meals have left the kitchen.", `/my-plans/${plan.id}`);
+        await withTemplate("plan.week_on_the_way", { week: week.weekNumber }, () => notify(plan.userId, `Week ${week.weekNumber} is on its way`, "Your meals have left the kitchen.", `/my-plans/${plan.id}`));
     } else if (status === "missed") {
-        await notify(plan.userId, `Week ${week.weekNumber} wasn't delivered`, "Sorry about that. You won't be charged for this delivery. Message your chef if you need anything.", `/my-plans/${plan.id}`);
+        await withTemplate("plan.week_missed", { week: week.weekNumber }, () => notify(plan.userId, `Week ${week.weekNumber} wasn't delivered`, "Sorry about that. You won't be charged for this delivery. Message your chef if you need anything.", `/my-plans/${plan.id}`));
     }
     await completeIfFinished(plan.id);
     res.json({ status });
@@ -533,8 +534,8 @@ router.post("/:id/messages", requireAuth, rateLimit(30, 60_000), async (req, res
     const senderId = getUserId(req);
     const [{ id }] = await db.insert(mealPlanMessages).values({ planId: plan.id, senderId, senderRole: role, body }).$returningId();
     const preview = body.length > 120 ? `${body.slice(0, 117)}...` : body;
-    if (role !== "customer") await notify(plan.userId, "New message about your meal plan", preview, `/my-plans/${plan.id}`, "message");
-    if (role !== "chef") await notifyChef(plan.chefId, "New message about a meal plan", preview, `/chef/dashboard?tab=plans&plan=${plan.id}`, "message");
+    if (role !== "customer") await withTemplate("message.plan_to_customer", { preview }, () => notify(plan.userId, "New message about your meal plan", preview, `/my-plans/${plan.id}`, "message"));
+    if (role !== "chef") await withTemplate("message.plan_to_chef", { preview }, () => notifyChef(plan.chefId, "New message about a meal plan", preview, `/chef/dashboard?tab=plans&plan=${plan.id}`, "message"));
     const [message] = await db.select().from(mealPlanMessages).where(eq(mealPlanMessages.id, id)).limit(1);
     res.status(201).json(message);
 });

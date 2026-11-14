@@ -420,6 +420,27 @@ export const siteSettings = mysqlTable("site_settings", {
     updatedAt: timestamp("updated_at").defaultNow().notNull(),
 });
 
+/** A Super Admin's version of a message template. Anything left empty uses the default wording. */
+export interface TemplateOverride {
+    channels?: Partial<Record<"inApp" | "push" | "email" | "sms", boolean>>;
+    title?: string;
+    body?: string;
+    pushTitle?: string;
+    pushBody?: string;
+    emailSubject?: string;
+    emailBody?: string;
+    sms?: string;
+}
+
+// The Super Admin's changes to message templates (see src/lib/templates/registry.ts for the defaults).
+export const notificationTemplates = mysqlTable("notification_templates", {
+    id: int("id").autoincrement().primaryKey(),
+    key: varchar("key", { length: 64 }).notNull().unique(),
+    value: json("value").$type<TemplateOverride>().notNull(),
+    updatedBy: int("updated_by").references(() => users.id, { onDelete: "set null" }),
+    updatedAt: timestamp("updated_at").defaultNow().notNull(),
+});
+
 // Keys for outside services (Stripe, Brevo) that Super Admins manage. Values are encrypted.
 export const integrationSettings = mysqlTable("integration_settings", {
     id: int("id").autoincrement().primaryKey(),

@@ -1,4 +1,5 @@
 import { Request, Router } from "express";
+import { withTemplate } from "../lib/templates";
 import { and, asc, desc, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
 import { chefCompliance, chefInvoices, chefProducts, chefs, eventQuoteMessages, eventQuotes, events, products, QuoteItem, users } from "../db/schema";
@@ -113,9 +114,9 @@ router.post("/", requireAuth, rateLimit(30, 60_000), async (req, res) => {
         await tx.insert(eventQuotes).values(requests.map((r) => ({ eventId, chefId: r.chefId, preferences: r.preferences, items: r.items })));
         return eventId;
     });
-    await Promise.all(requests.map((r) => notifyChef(r.chefId, "New event quote request", `${eventName}: ${headcount} guests on ${eventDate.toLocaleDateString("en-GB")}. Please send your quote.`, "/chef/dashboard?tab=bookings")));
-    await notify(userId, "We've sent your request", `${requests.length} chef${requests.length === 1 ? " has" : "s have"} been asked to quote for ${eventName}. We'll tell you when quotes arrive.`, `/my-bookings/${id}`, "event");
-    await notifyAdmins("New event booking", `${eventName} needs quotes from ${requests.length} chef${requests.length === 1 ? "" : "s"}.`, "/admin/events");
+    await Promise.all(requests.map((r) => withTemplate("event.quote_request_chef", { eventName, headcount, eventDate: eventDate.toLocaleDateString("en-GB") }, () => notifyChef(r.chefId, "New event quote request", `${eventName}: ${headcount} guests on ${eventDate.toLocaleDateString("en-GB")}. Please send your quote.`, "/chef/dashboard?tab=bookings"))));
+    await withTemplate("event.request_sent", { eventName, chefCount: requests.length }, () => notify(userId, "We've sent your request", `${requests.length} chef${requests.length === 1 ? " has" : "s have"} been asked to quote for ${eventName}. We'll tell you when quotes arrive.`, `/my-bookings/${id}`, "event"));
+    await withTemplate("admin.event_booked", { eventName, chefCount: requests.length }, () => notifyAdmins("New event booking", `${eventName} needs quotes from ${requests.length} chef${requests.length === 1 ? "" : "s"}.`, "/admin/events"));
     const [created] = await db.select().from(events).where(eq(events.id, id)).limit(1);
     res.status(201).json(created);
 });
@@ -209,16 +210,16 @@ router.put("/admin/:id", requireAdmin, async (req, res) => {
     if (!STATUSES.includes(status)) throw badRequest("Invalid status");
     await db.update(events).set({ ...eventFields(req.body), status }).where(eq(events.id, id));
     if (status === "completed" && existing.status !== "completed") {
-        await notify(existing.userId, "How was your event?", `We hope ${existing.eventName} was wonderful. You can now rate your chefs.`, `/my-bookings/${id}`, "event");
+        await withTemplate("event.review_request", { eventName: existing.eventName }, () => notify(existing.userId, "How was your event?", `We hope ${existing.eventName} was wonderful. You can now rate your chefs.`, `/my-bookings/${id}`, "event"));
     } else if (status !== existing.status) {
-        await notify(existing.userId, "Your booking was updated", `${existing.eventName} is now: ${status.replace("_", " ")}.`, `/my-bookings/${id}`, "event");
+        await withTemplate("event.status_updated", { eventName: existing.eventName, status: status.replace("_", " ") }, () => notify(existing.userId, "Your booking was updated", `${existing.eventName} is now: ${status.replace("_", " ")}.`, `/my-bookings/${id}`, "event"));
     }
     // A cancelled booking closes every chef's part and tells them not to prepare.
     if (status === "cancelled" && existing.status !== "cancelled") {
         const quotes = await db.select().from(eventQuotes).where(eq(eventQuotes.eventId, id));
         for (const quote of quotes) {
             if (["requested", "submitted", "accepted"].includes(quote.status)) {
-                await notifyChef(quote.chefId, "Event cancelled", `MYUKCHEF has cancelled ${existing.eventName}. You no longer need to prepare for it.`, "/chef/dashboard?tab=bookings");
+                await withTemplate("event.cancelled_chef", { eventName: existing.eventName, cancelledBy: "MYUKCHEF" }, () => notifyChef(quote.chefId, "Event cancelled", `MYUKCHEF has cancelled ${existing.eventName}. You no longer need to prepare for it.`, "/chef/dashboard?tab=bookings"));
             }
         }
         await db.update(eventQuotes).set({ status: "not_selected" }).where(and(eq(eventQuotes.eventId, id), inArray(eventQuotes.status, ["requested", "submitted"])));
@@ -250,7 +251,7 @@ router.post("/admin/:id/quotes", requireAdmin, async (req, res) => {
     const preferences = text(req.body.preferences, 1000) || null;
     await db.insert(eventQuotes).values({ eventId: event.id, chefId, preferences, items: [] });
     await db.update(events).set({ status: "quoting" }).where(eq(events.id, event.id));
-    await notifyChef(chefId, "New event quote request", `${event.eventName}: ${event.headcount} guests. Please send your quote.`, "/chef/dashboard?tab=bookings");
+    await withTemplate("event.quote_request_chef", { eventName: event.eventName, headcount: event.headcount, eventDate: "" }, () => notifyChef(chefId, "New event quote request", `${event.eventName}: ${event.headcount} guests. Please send your quote.`, "/chef/dashboard?tab=bookings"));
     res.status(201).json({ ok: true });
 });
 
@@ -269,12 +270,12 @@ router.post("/admin/:id/payment", requireAdmin, async (req, res) => {
         await refundEventCard(event);
         await db.update(eventQuotes).set({ payoutStatus: "cancelled" }).where(eq(eventQuotes.eventId, event.id));
         await db.update(events).set({ paymentStatus: "refunded", status: "cancelled" }).where(eq(events.id, event.id));
-        await notify(event.userId, "Your booking was refunded", `${event.eventName} has been cancelled and refunded.`, `/my-bookings/${event.id}`, "event");
+        await withTemplate("event.refunded", { eventName: event.eventName }, () => notify(event.userId, "Your booking was refunded", `${event.eventName} has been cancelled and refunded.`, `/my-bookings/${event.id}`, "event"));
     } else if (status === "unpaid") {
         // Clears a customer's "I've paid" when the money hasn't arrived.
         if (event.paymentStatus !== "submitted") throw badRequest("Only a payment waiting to be checked can be reset");
         await db.update(events).set({ paymentStatus: "unpaid" }).where(eq(events.id, event.id));
-        await notify(event.userId, "We couldn't find your payment", `We haven't received your payment for ${event.eventName} yet. Please check the reference and try again.`, `/my-bookings/${event.id}`, "event");
+        await withTemplate("event.payment_not_found", { eventName: event.eventName }, () => notify(event.userId, "We couldn't find your payment", `We haven't received your payment for ${event.eventName} yet. Please check the reference and try again.`, `/my-bookings/${event.id}`, "event"));
     } else {
         throw badRequest("Invalid payment status");
     }
@@ -300,7 +301,7 @@ router.patch("/admin/quotes/:quoteId", requireAdmin, async (req, res) => {
         } else {
             await db.update(eventQuotes).set({ payoutStatus, payoutPaidAt: payoutStatus === "paid" ? new Date() : null }).where(eq(eventQuotes.id, quote.id));
             if (payoutStatus === "paid" && quote.payoutStatus !== "paid") {
-                await notifyChef(quote.chefId, "Your payout has been sent", `MYUKCHEF has paid you £${(quote.payoutAmount ?? 0).toFixed(2)} for ${event?.eventName}.`, "/chef/dashboard?tab=bookings");
+                await withTemplate("payout.event_paid", { amount: (quote.payoutAmount ?? 0).toFixed(2), eventName: event?.eventName ?? "" }, () => notifyChef(quote.chefId, "Your payout has been sent", `MYUKCHEF has paid you £${(quote.payoutAmount ?? 0).toFixed(2)} for ${event?.eventName}.`, "/chef/dashboard?tab=bookings"));
             }
         }
     }
@@ -359,16 +360,16 @@ router.post("/:id/confirm", requireAuth, async (req, res) => {
     for (const quote of quotes) {
         if (accepted.includes(quote)) {
             await db.update(eventQuotes).set({ status: "accepted" }).where(eq(eventQuotes.id, quote.id));
-            if (quote.status !== "accepted") await notifyChef(quote.chefId, "Your quote was chosen", `The customer chose your quote for ${event.eventName}. You'll get the venue details once they've paid.`, "/chef/dashboard?tab=bookings");
+            if (quote.status !== "accepted") await withTemplate("event.quote_chosen", { eventName: event.eventName }, () => notifyChef(quote.chefId, "Your quote was chosen", `The customer chose your quote for ${event.eventName}. You'll get the venue details once they've paid.`, "/chef/dashboard?tab=bookings"));
         } else if (["submitted", "requested", "accepted"].includes(quote.status)) {
             await db.update(eventQuotes).set({ status: "not_selected" }).where(eq(eventQuotes.id, quote.id));
-            await notifyChef(quote.chefId, "Quote not selected", `The customer went with other options for ${event.eventName}. Thanks for replying.`, "/chef/dashboard?tab=bookings");
+            await withTemplate("event.quote_not_chosen", { eventName: event.eventName }, () => notifyChef(quote.chefId, "Quote not selected", `The customer went with other options for ${event.eventName}. Thanks for replying.`, "/chef/dashboard?tab=bookings"));
         }
     }
     const finalTotal = roundMoney(accepted.reduce((sum, q) => sum + (q.total ?? 0), 0));
     await db.update(events).set({ status: "awaiting_payment", finalTotal }).where(eq(events.id, event.id));
-    await notify(event.userId, "Your quotes are confirmed", `Next, please pay £${finalTotal.toFixed(2)} in full to confirm ${event.eventName}.`, `/my-bookings/${event.id}`, "event");
-    await notifyAdmins("Quotes confirmed", `${event.eventName} is confirmed at £${finalTotal.toFixed(2)} and awaiting payment.`, "/admin/events");
+    await withTemplate("event.quotes_confirmed", { eventName: event.eventName, total: finalTotal.toFixed(2) }, () => notify(event.userId, "Your quotes are confirmed", `Next, please pay £${finalTotal.toFixed(2)} in full to confirm ${event.eventName}.`, `/my-bookings/${event.id}`, "event"));
+    await withTemplate("admin.event_quotes_confirmed", { eventName: event.eventName, total: finalTotal.toFixed(2) }, () => notifyAdmins("Quotes confirmed", `${event.eventName} is confirmed at £${finalTotal.toFixed(2)} and awaiting payment.`, "/admin/events"));
     res.json({ status: "awaiting_payment", finalTotal });
 });
 
@@ -377,7 +378,7 @@ router.post("/:id/paid", requireAuth, async (req, res) => {
     const event = await ownEvent(req);
     if (event.status !== "awaiting_payment") throw badRequest("This booking isn't awaiting payment");
     await db.update(events).set({ paymentStatus: "submitted" }).where(eq(events.id, event.id));
-    await notifyAdmins("Payment to check", `The customer says they've paid £${(event.finalTotal ?? 0).toFixed(2)} for ${event.eventName} (reference ${paymentReference(event.id)}).`, "/admin/events");
+    await withTemplate("admin.event_payment_to_check", { eventName: event.eventName, total: (event.finalTotal ?? 0).toFixed(2), reference: paymentReference(event.id) }, () => notifyAdmins("Payment to check", `The customer says they've paid £${(event.finalTotal ?? 0).toFixed(2)} for ${event.eventName} (reference ${paymentReference(event.id)}).`, "/admin/events"));
     res.json({ paymentStatus: "submitted" });
 });
 
@@ -391,7 +392,7 @@ router.patch("/:id/cancel", requireAuth, async (req, res) => {
     for (const quote of quotes) {
         if (["requested", "submitted", "accepted"].includes(quote.status)) {
             await db.update(eventQuotes).set({ status: "not_selected" }).where(eq(eventQuotes.id, quote.id));
-            await notifyChef(quote.chefId, "Event cancelled", `The customer cancelled ${event.eventName}. Nothing further is needed.`, "/chef/dashboard?tab=bookings");
+            await withTemplate("event.cancelled_chef", { eventName: event.eventName, cancelledBy: "the customer" }, () => notifyChef(quote.chefId, "Event cancelled", `The customer cancelled ${event.eventName}. Nothing further is needed.`, "/chef/dashboard?tab=bookings"));
         }
     }
     res.json({ message: "Booking cancelled" });
@@ -411,8 +412,8 @@ router.post("/quotes/:quoteId/messages", requireAuth, rateLimit(30, 60_000), asy
     if (role !== "admin") assertNoContactDetails(body);
     const [{ id }] = await db.insert(eventQuoteMessages).values({ quoteId: quote.id, senderId: userId, senderRole: role, body }).$returningId();
     const preview = body.length > 120 ? `${body.slice(0, 117)}...` : body;
-    if (role !== "customer" && event) await notify(event.userId, `New message about ${event.eventName}`, preview, `/my-bookings/${event.id}`, "message");
-    if (role !== "chef") await notifyChef(quote.chefId, `New message about ${event?.eventName}`, preview, `/chef/dashboard?tab=bookings&quote=${quote.id}`, "message");
+    if (role !== "customer" && event) await withTemplate("message.event_to_customer", { eventName: event.eventName, preview }, () => notify(event.userId, `New message about ${event.eventName}`, preview, `/my-bookings/${event.id}`, "message"));
+    if (role !== "chef") await withTemplate("message.event_to_chef", { eventName: event?.eventName ?? "", preview }, () => notifyChef(quote.chefId, `New message about ${event?.eventName}`, preview, `/chef/dashboard?tab=bookings&quote=${quote.id}`, "message"));
     const [message] = await db.select().from(eventQuoteMessages).where(eq(eventQuoteMessages.id, id)).limit(1);
     res.status(201).json(message);
 });

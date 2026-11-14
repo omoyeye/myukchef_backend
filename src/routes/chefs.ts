@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { withTemplate } from "../lib/templates";
 import fs from "fs";
 import path from "path";
 import { addCredential, CREDENTIAL_TYPES, deleteCredential, hasVerifiedHygiene, listForChef, publicCredentials, reviewCredential, updateCredential } from "../lib/credentials";
@@ -127,8 +128,8 @@ router.post("/register", rateLimit(5, 60_000), async (req, res) => {
             agreementAcceptedAt: new Date(),
         }).$returningId();
         const [newChef] = await db.select().from(chefs).where(eq(chefs.id, newChefId)).limit(1);
-        await notify(newUser.id, "We've got your application", "Our team will review it soon. In the meantime, add your food safety and payout details in the Chef Portal.", "/chef/dashboard?tab=compliance");
-        await notifyAdmins("New chef application", `${displayName} has applied to join.`, "/admin/chefs");
+        await withTemplate("chef.application_received", {}, () => notify(newUser.id, "We've got your application", "Our team will review it soon. In the meantime, add your food safety and payout details in the Chef Portal.", "/chef/dashboard?tab=compliance"));
+        await withTemplate("admin.chef_applied", { chefName: displayName }, () => notifyAdmins("New chef application", `${displayName} has applied to join.`, "/admin/chefs"));
 
         const { password: _, ...userSafe } = newUser;
         res.status(201).json({ user: userSafe, chef: newChef, token: signToken(newUser.id) });
@@ -317,7 +318,7 @@ router.patch("/:id/status", async (req, res) => {
             suspended: ["Your chef account is suspended", rejectionReason || "Please contact support for details."],
             rejected: ["About your chef application", rejectionReason || "We can't approve your application at the moment. Please contact support for details."],
         };
-        if (updated && words[status]) await notify(updated.userId, words[status][0], words[status][1], "/chef/dashboard");
+        if (updated && words[status]) await withTemplate(`chef.account_${status}`, { reason: rejectionReason ?? "" }, () => notify(updated.userId, words[status][0], words[status][1], "/chef/dashboard"));
         res.json(updated);
     } catch (error) {
         console.error("Chef status error:", error);
@@ -416,7 +417,7 @@ router.post("/me/products", async (req, res) => {
             status: "pending",
         });
         const [created] = await db.select().from(chefProducts).where(eq(chefProducts.id, id)).limit(1);
-        await notifyAdmins("New dish to review", `${chef.displayName} added ${name}.`, "/admin/chefs");
+        await withTemplate("admin.dish_to_review", { chefName: chef.displayName, dishName: name }, () => notifyAdmins("New dish to review", `${chef.displayName} added ${name}.`, "/admin/chefs"));
         res.status(201).json(created);
     } catch (error) {
         if ((error as { status?: number }).status === 400) return res.status(400).json({ error: (error as Error).message });
@@ -572,7 +573,7 @@ router.put("/me/compliance", async (req, res) => {
     const values = { ...complianceValues(req.body), verifiedAt: null, updatedAt: new Date() };
     await db.insert(chefCompliance).values({ chefId: chef.id, ...values }).onDuplicateKeyUpdate({ set: values });
     const [row] = await db.select().from(chefCompliance).where(eq(chefCompliance.chefId, chef.id)).limit(1);
-    if (complianceComplete(row)) await notifyAdmins("Chef details to check", `${chef.displayName} has updated their food safety and payout details.`, "/admin/chefs");
+    if (complianceComplete(row)) await withTemplate("admin.chef_details_updated", { chefName: chef.displayName }, () => notifyAdmins("Chef details to check", `${chef.displayName} has updated their food safety and payout details.`, "/admin/chefs"));
     res.json({ ...row, complete: complianceComplete(row), verified: false });
 });
 
@@ -587,7 +588,7 @@ router.patch("/admin/:id/compliance", requireAdmin, async (req, res) => {
     if (req.body.verified && !complianceComplete(row)) return res.status(400).json({ error: "These details aren't complete yet" });
     if (req.body.verified && !(await hasVerifiedHygiene(chefId))) return res.status(400).json({ error: "Verify the chef's food hygiene certificate first. It's a requirement before they can be verified." });
     if (row) await db.update(chefCompliance).set({ verifiedAt: req.body.verified ? new Date() : null }).where(eq(chefCompliance.chefId, chefId));
-    if (req.body.verified) await notifyChef(chefId, "Your details are verified", "Thanks. We've checked your food safety and payout details.", "/chef/dashboard?tab=compliance");
+    if (req.body.verified) await withTemplate("chef.details_verified", {}, () => notifyChef(chefId, "Your details are verified", "Thanks. We've checked your food safety and payout details.", "/chef/dashboard?tab=compliance"));
     res.json({ verified: !!req.body.verified });
 });
 
@@ -637,7 +638,7 @@ router.patch("/admin/products/:id/status", async (req, res) => {
         await db.update(chefProducts).set({ status }).where(eq(chefProducts.id, id));
         const [updated] = await db.select().from(chefProducts).where(eq(chefProducts.id, id)).limit(1);
         if (updated && status !== "pending") {
-            await notifyChef(updated.chefId, status === "approved" ? "Your dish is live" : "Your dish wasn't approved", status === "approved" ? `${updated.name} is now on sale.` : `${updated.name} needs changes. Please check it and try again.`, "/chef/dashboard?tab=products");
+            await withTemplate(status === "approved" ? "chef.dish_approved" : "chef.dish_rejected", { dishName: updated.name }, () => notifyChef(updated.chefId, status === "approved" ? "Your dish is live" : "Your dish wasn't approved", status === "approved" ? `${updated.name} is now on sale.` : `${updated.name} needs changes. Please check it and try again.`, "/chef/dashboard?tab=products"));
         }
         res.json(updated);
     } catch (error) {

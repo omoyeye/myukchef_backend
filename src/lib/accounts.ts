@@ -1,8 +1,9 @@
 import { and, eq, isNull, sql } from "drizzle-orm";
+import { withTemplate } from "./templates";
 import { db } from "../db";
 import { siteSettings, users } from "../db/schema";
 import { signPurposeToken, verifyPurposeToken } from "./auth";
-import { sendNotificationEmail } from "./mail";
+import { sendVerifyEmail } from "./mail";
 import { notify } from "./notify";
 
 /**
@@ -18,12 +19,7 @@ const VERIFY_DAYS = 7;
 /** Emails a link that confirms the address. It lasts a week. */
 export async function sendVerificationEmail(user: Pick<User, "id" | "email" | "name">) {
     const token = signPurposeToken(user.id, "verify-email", VERIFY_DAYS * 86400);
-    await sendNotificationEmail(
-        user.email,
-        "Confirm your email address",
-        `Hi ${user.name.split(" ")[0]}, please confirm this is your email address so we can send your order updates and receipts to the right place. The link works for ${VERIFY_DAYS} days.`,
-        `/verify-email?token=${encodeURIComponent(token)}`,
-    );
+    await sendVerifyEmail(user.email, user.name, `/verify-email?token=${encodeURIComponent(token)}`);
 }
 
 export async function confirmEmail(token: unknown) {
@@ -84,8 +80,8 @@ export async function rewardReferral(userId: number) {
     if (!(claim as unknown as { affectedRows?: number }).affectedRows) return;
     await db.update(users).set({ points: sql`${users.points} + ${rules.points}` }).where(eq(users.id, userId));
     await db.update(users).set({ points: sql`${users.points} + ${rules.points}` }).where(eq(users.id, user.referredBy));
-    await notify(userId, `You've earned ${rules.points} points`, "Thanks for joining through a friend. Your welcome points are in your account.", "/profile?tab=rewards");
-    await notify(user.referredBy, `You've earned ${rules.points} points`, `${user.name.split(" ")[0]} placed their first order with your code. Thank you for spreading the word!`, "/profile?tab=rewards");
+    await withTemplate("referral.rewarded_new", { points: rules.points }, () => notify(userId, `You've earned ${rules.points} points`, "Thanks for joining through a friend. Your welcome points are in your account.", "/profile?tab=rewards"));
+    await withTemplate("referral.rewarded_referrer", { points: rules.points, friendName: user.name.split(" ")[0] }, () => notify(user.referredBy!, `You've earned ${rules.points} points`, `${user.name.split(" ")[0]} placed their first order with your code. Thank you for spreading the word!`, "/profile?tab=rewards"));
 }
 
 /** What the "refer a friend" page shows. */

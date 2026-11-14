@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { withTemplate } from "../lib/templates";
 import { desc, eq } from "drizzle-orm";
 import { z } from "zod";
 import { db } from "../db";
@@ -23,7 +24,7 @@ contactRouter.post("/", rateLimit(5, 60_000), async (req, res) => {
         const data = contactSchema.parse(req.body);
         await db.insert(supportMessages).values(data);
         sendSupportRequestEmail(data).catch((e: Error) => console.error("Support email failed:", e.message));
-        await notifyAdmins("New support message", `${data.name} has sent a message.`, "/admin/support");
+        await withTemplate("admin.support_message", { name: data.name }, () => notifyAdmins("New support message", `${data.name} has sent a message.`, "/admin/support"));
         res.json({ message: "Support request sent successfully" });
     } catch (error) {
         if (error instanceof z.ZodError) {

@@ -1,4 +1,5 @@
 import { and, eq, inArray, lt } from "drizzle-orm";
+import { withTemplate } from "./templates";
 import { db } from "../db";
 import { eventQuotes, events, siteSettings } from "../db/schema";
 import { notify } from "./notify";
@@ -31,7 +32,7 @@ export async function refreshQuoteStage(eventId: number) {
         .where(and(eq(eventQuotes.eventId, eventId), eq(eventQuotes.status, "requested"))).limit(1);
     if (waiting.length > 0) return;
     await db.update(events).set({ status: "quotes_ready" }).where(eq(events.id, eventId));
-    await notify(event.userId, "All your quotes are in", `Every chef has replied about ${event.eventName}. Compare them and confirm the ones you want.`, `/my-bookings/${eventId}`, "event");
+    await withTemplate("event.quotes_ready", { eventName: event.eventName }, () => notify(event.userId, "All your quotes are in", `Every chef has replied about ${event.eventName}. Compare them and confirm the ones you want.`, `/my-bookings/${eventId}`, "event"));
 }
 
 /** Daily tidying: bookings that passed their date unpaid close, and paid ones finish so customers can rate. */
@@ -40,13 +41,13 @@ export async function runEventJobs() {
     const unpaid = await db.select().from(events).where(and(inArray(events.status, ["quoting", "pending", "quotes_ready", "awaiting_payment"]), lt(events.eventDate, now)));
     for (const event of unpaid) {
         await db.update(events).set({ status: "cancelled" }).where(eq(events.id, event.id));
-        await notify(event.userId, "Your booking has closed", `The date for ${event.eventName} has passed without payment, so the booking has closed. Nothing is owed.`, `/my-bookings/${event.id}`, "event");
+        await withTemplate("event.closed_unpaid", { eventName: event.eventName }, () => notify(event.userId, "Your booking has closed", `The date for ${event.eventName} has passed without payment, so the booking has closed. Nothing is owed.`, `/my-bookings/${event.id}`, "event"));
     }
     const twoDaysAgo = new Date(now.getTime() - 2 * 24 * 60 * 60 * 1000);
     const finished = await db.select().from(events).where(and(inArray(events.status, ["confirmed", "in_progress"]), lt(events.eventDate, twoDaysAgo)));
     for (const event of finished) {
         await db.update(events).set({ status: "completed" }).where(eq(events.id, event.id));
-        await notify(event.userId, "How was your event?", `We hope ${event.eventName} was wonderful. You can now rate your chefs.`, `/my-bookings/${event.id}`, "event");
+        await withTemplate("event.review_request", { eventName: event.eventName }, () => notify(event.userId, "How was your event?", `We hope ${event.eventName} was wonderful. You can now rate your chefs.`, `/my-bookings/${event.id}`, "event"));
     }
 }
 

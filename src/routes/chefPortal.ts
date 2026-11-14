@@ -1,4 +1,5 @@
 import { Request, Router } from "express";
+import { withTemplate } from "../lib/templates";
 import { and, asc, desc, eq, inArray, ne, or } from "drizzle-orm";
 import { db } from "../db";
 import { chefProducts, chefs, eventQuoteMessages, eventQuotes, events, orderItems, orders, products, users } from "../db/schema";
@@ -174,7 +175,7 @@ router.post("/quotes/:id/submit", async (req, res) => {
     if (total <= 0) throw badRequest("Please enter your price");
 
     await db.update(eventQuotes).set({ items, serviceFee, total, willAttend, note, status: "submitted", submittedAt: new Date() }).where(eq(eventQuotes.id, quote.id));
-    await notify(event.userId, `${quote.status === "submitted" ? "Updated quote" : "New quote"} for ${event.eventName}`, `A chef has sent a quote of £${total.toFixed(2)}.`, `/my-bookings/${event.id}`, "event");
+    await withTemplate("event.quote_received", { eventName: event.eventName, total: total.toFixed(2) }, () => notify(event.userId, `${quote.status === "submitted" ? "Updated quote" : "New quote"} for ${event.eventName}`, `A chef has sent a quote of £${total.toFixed(2)}.`, `/my-bookings/${event.id}`, "event"));
     await refreshQuoteStage(event.id);
     const [updated] = await db.select().from(eventQuotes).where(eq(eventQuotes.id, quote.id)).limit(1);
     res.json(updated);
@@ -188,7 +189,7 @@ router.post("/quotes/:id/decline", async (req, res) => {
     const note = String(req.body.note ?? "").trim().slice(0, 500) || null;
     assertNoContactDetails(note);
     await db.update(eventQuotes).set({ status: "declined", note, total: null }).where(eq(eventQuotes.id, quote.id));
-    await notify(event.userId, `A chef can't quote for ${event.eventName}`, note || "They aren't able to take this one. Your other quotes aren't affected.", `/my-bookings/${event.id}`, "event");
+    await withTemplate("event.chef_declined", { eventName: event.eventName, note: note ?? "" }, () => notify(event.userId, `A chef can't quote for ${event.eventName}`, note || "They aren't able to take this one. Your other quotes aren't affected.", `/my-bookings/${event.id}`, "event"));
     await refreshQuoteStage(event.id);
     res.json({ status: "declined" });
 });
@@ -201,7 +202,7 @@ router.patch("/quotes/:id/attendance", async (req, res) => {
     await db.update(eventQuotes).set({ willAttend: req.body.willAttend }).where(eq(eventQuotes.id, quote.id));
     if (event && req.body.willAttend !== quote.willAttend) {
         const words: Record<string, string> = { yes: "will attend", if_possible: "will attend if possible", no: "can't attend in person" };
-        await notify(event.userId, `Update for ${event.eventName}`, `One of your chefs ${words[req.body.willAttend]}.`, `/my-bookings/${event.id}`, "event");
+        await withTemplate("event.attendance_update", { eventName: event.eventName, update: words[req.body.willAttend] }, () => notify(event.userId, `Update for ${event.eventName}`, `One of your chefs ${words[req.body.willAttend]}.`, `/my-bookings/${event.id}`, "event"));
     }
     res.json({ willAttend: req.body.willAttend });
 });

@@ -1,4 +1,5 @@
 import { and, eq } from "drizzle-orm";
+import { withTemplate } from "./templates";
 import type Stripe from "stripe";
 import { db } from "../db";
 import { eventQuotes, events, mealPlanWeeks, mealPlans, users } from "../db/schema";
@@ -53,9 +54,9 @@ export async function markEventPaid(eventId: number, paymentIntentId: string | n
         const accepted = await db.select().from(eventQuotes).where(and(eq(eventQuotes.eventId, event.id), eq(eventQuotes.status, "accepted")));
         for (const quote of accepted) {
             await db.update(eventQuotes).set({ commissionPercent, payoutAmount: roundMoney((quote.total ?? 0) * (1 - commissionPercent / 100)), payoutStatus: "pending" }).where(eq(eventQuotes.id, quote.id));
-            await notifyChef(quote.chefId, "Booking paid: you're confirmed", `${event.eventName} is paid in full. You can now see the venue, date and time. Your payout follows from MYUKCHEF.`, "/chef/dashboard?tab=bookings");
+            await withTemplate("event.paid_chef", { eventName: event.eventName }, () => notifyChef(quote.chefId, "Booking paid: you're confirmed", `${event.eventName} is paid in full. You can now see the venue, date and time. Your payout follows from MYUKCHEF.`, "/chef/dashboard?tab=bookings"));
         }
-        await notify(event.userId, "Payment received", `Thank you. ${event.eventName} is confirmed and your chefs have been told.`, `/my-bookings/${event.id}`, "event");
+        await withTemplate("event.paid", { eventName: event.eventName }, () => notify(event.userId, "Payment received", `Thank you. ${event.eventName} is confirmed and your chefs have been told.`, `/my-bookings/${event.id}`, "event"));
     }
     return (await db.select().from(events).where(eq(events.id, event.id)).limit(1))[0]!;
 }
@@ -105,8 +106,8 @@ async function markWeekPaid(weekId: number, paymentIntentId: string | null) {
     const [week] = await db.select().from(mealPlanWeeks).where(eq(mealPlanWeeks.id, weekId)).limit(1);
     const [plan] = week ? await db.select().from(mealPlans).where(eq(mealPlans.id, week.planId)).limit(1) : [];
     if (!week || !plan) return;
-    await notify(plan.userId, `Week ${week.weekNumber} paid`, `Thank you. We've received £${week.total.toFixed(2)} for this delivery.`, `/my-plans/${plan.id}`);
-    await notifyChef(plan.chefId, `Week ${week.weekNumber} paid`, "The customer has paid for this delivery by card.", `/chef/dashboard?tab=plans&plan=${plan.id}`);
+    await withTemplate("plan.week_paid", { week: week.weekNumber, amount: week.total.toFixed(2) }, () => notify(plan.userId, `Week ${week.weekNumber} paid`, `Thank you. We've received £${week.total.toFixed(2)} for this delivery.`, `/my-plans/${plan.id}`));
+    await withTemplate("plan.week_paid_chef", { week: week.weekNumber }, () => notifyChef(plan.chefId, `Week ${week.weekNumber} paid`, "The customer has paid for this delivery by card.", `/chef/dashboard?tab=plans&plan=${plan.id}`));
 }
 
 // === Shared: what Stripe says ===

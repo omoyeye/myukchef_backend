@@ -1,4 +1,5 @@
 import compression from "compression";
+import { withTemplate } from "./lib/templates";
 import cors from "cors";
 import express, { NextFunction, Request, Response } from "express";
 import fs from "fs";
@@ -25,6 +26,7 @@ import { integrationsRouter } from "./routes/integrations";
 import { payoutsRouter } from "./routes/payouts";
 import { healthRouter, reportServerError } from "./routes/health";
 import { reportsRouter } from "./routes/reports";
+import templatesRouter from "./routes/templates";
 import { startPayoutJobs } from "./lib/chefPayouts";
 import { startCredentialJobs } from "./lib/credentials";
 import { stripeWebhook } from "./routes/payments";
@@ -104,6 +106,7 @@ app.use("/api/admin/integrations", integrationsRouter);
 app.use("/api/payouts", payoutsRouter);
 app.use("/api/health", healthRouter);
 app.use("/api/reports", reportsRouter);
+app.use("/api/admin/templates", templatesRouter);
 app.use("/api", (_req, res) => res.status(404).json({ error: "Not found" }));
 
 app.get("/uploads/sm/:file", serveThumbnail);
@@ -160,6 +163,6 @@ app.listen(port, () => {
     // Unpaid orders whose payment page ran out are released, in case Stripe's webhook didn't arrive.
     setInterval(() => releaseStaleUnpaidOrders().catch((e) => console.error("Unpaid order check failed:", e)), 15 * 60 * 1000).unref();
     migrateAllergens()
-        .then(({ chefIds }) => Promise.all(chefIds.map((id) => notifyChef(id, "Please check your dishes' allergens", "We now record all 14 allergens. Your dishes are off sale until you confirm each one under My dishes.", "/chef/dashboard?tab=products"))))
+        .then(({ chefIds }) => Promise.all(chefIds.map((id) => withTemplate("chef.allergens_check", {}, () => notifyChef(id, "Please check your dishes' allergens", "We now record all 14 allergens. Your dishes are off sale until you confirm each one under My dishes.", "/chef/dashboard?tab=products")))))
         .catch((e) => console.error("Allergen update failed:", e));
 });

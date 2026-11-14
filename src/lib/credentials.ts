@@ -1,4 +1,5 @@
 import fs from "fs";
+import { withTemplate } from "./templates";
 import { and, desc, eq, inArray, lt } from "drizzle-orm";
 import { db } from "../db";
 import { chefCredentials } from "../db/schema";
@@ -62,7 +63,7 @@ export const listForChef = (chefId: number) =>
 export async function addCredential(chefId: number, chefName: string, body: Record<string, unknown>) {
     const values = cleanInput(body);
     const [{ id }] = await db.insert(chefCredentials).values({ chefId, ...values }).$returningId();
-    await notifyAdmins("Certificate to check", `${chefName} added: ${values.title}.`, "/admin/chefs?tab=credentials");
+    await withTemplate("admin.credential_to_check", { chefName, title: values.title }, () => notifyAdmins("Certificate to check", `${chefName} added: ${values.title}.`, "/admin/chefs?tab=credentials"));
     return (await db.select().from(chefCredentials).where(eq(chefCredentials.id, id)).limit(1))[0];
 }
 
@@ -82,7 +83,7 @@ export async function updateCredential(chefId: number, chefName: string, id: num
         const values = cleanInput({ ...row, ...body });
         if (row.document && row.document !== values.document) removeFile(row.document);
         await db.update(chefCredentials).set({ ...values, status: "pending", reviewNote: null, verifiedAt: null, updatedAt: new Date() }).where(eq(chefCredentials.id, row.id));
-        await notifyAdmins("Certificate to check", `${chefName} updated: ${values.title}.`, "/admin/chefs?tab=credentials");
+        await withTemplate("admin.credential_to_check", { chefName, title: values.title }, () => notifyAdmins("Certificate to check", `${chefName} updated: ${values.title}.`, "/admin/chefs?tab=credentials"));
     }
     return (await db.select().from(chefCredentials).where(eq(chefCredentials.id, row.id)).limit(1))[0];
 }
@@ -108,12 +109,12 @@ export async function reviewCredential(id: number, status: unknown, note: unknow
     if (status === "verified" && row.expiresOn && row.expiresOn < today()) throw fail("This certificate has expired, so it can't be verified.");
     await db.update(chefCredentials).set({ status, reviewNote: reason, verifiedAt: status === "verified" ? new Date() : null, updatedAt: new Date() }).where(eq(chefCredentials.id, row.id));
     if (status !== "pending") {
-        await notifyChef(
+        await withTemplate(status === "verified" ? "chef.credential_verified" : "chef.credential_rejected", { title: row.title, reason: reason ?? "" }, () => notifyChef(
             row.chefId,
             status === "verified" ? `${row.title} verified` : `${row.title} needs another look`,
             status === "verified" ? "It now shows as verified on your public page." : reason!,
             "/chef/dashboard?tab=compliance",
-        );
+        ));
     }
     return (await db.select().from(chefCredentials).where(eq(chefCredentials.id, row.id)).limit(1))[0];
 }
@@ -145,7 +146,7 @@ export async function expireCredentials() {
     const expired = await db.select().from(chefCredentials).where(and(eq(chefCredentials.status, "verified"), lt(chefCredentials.expiresOn, today())));
     for (const row of expired) {
         await db.update(chefCredentials).set({ status: "expired", updatedAt: new Date() }).where(eq(chefCredentials.id, row.id));
-        await notifyChef(row.chefId, `${row.title} has expired`, "Please add your renewed certificate so it shows on your page again.", "/chef/dashboard?tab=compliance");
+        await withTemplate("chef.credential_expired", { title: row.title }, () => notifyChef(row.chefId, `${row.title} has expired`, "Please add your renewed certificate so it shows on your page again.", "/chef/dashboard?tab=compliance"));
     }
     return expired.length;
 }

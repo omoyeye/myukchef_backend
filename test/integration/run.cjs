@@ -46,7 +46,12 @@ const env = {
     run("npx drizzle-kit push --force");
     run("npx tsx src/seed.ts --demo");
 
-    const server = spawn(process.execPath, [path.join(root, "node_modules/tsx/dist/cli.mjs"), "src/index.ts"], { cwd: root, env, stdio: ["ignore", "ignore", "pipe"] });
+    const server = spawn(process.execPath, [path.join(root, "node_modules/tsx/dist/cli.mjs"), "src/index.ts"], { cwd: root, env, stdio: ["ignore", "pipe", "pipe"] });
+    // The server's own output, shown when a test file fails.
+    let serverLog = "";
+    const keep = (d) => { serverLog = (serverLog + d).slice(-20000); };
+    server.stdout.on("data", keep);
+    server.stderr.on("data", keep);
     let serverErrors = "";
     server.stderr.on("data", (d) => { serverErrors += d; });
     const stop = () => { try { server.kill(); } catch { /* already gone */ } };
@@ -67,6 +72,8 @@ const env = {
             execSync(`node ${JSON.stringify(path.join(__dirname, file))}`, { cwd: root, env, stdio: "inherit" });
         } catch {
             failed++;
+            const NL = String.fromCharCode(10);
+            console.log(`${NL}--- last server output ---${NL}${serverLog.split(NL).slice(-60).join(NL)}${NL}--- end ---`);
         }
     }
     stop();
