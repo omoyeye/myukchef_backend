@@ -29,6 +29,14 @@ export async function getPayoutRules() {
     };
 }
 
+/** Whether MYUKCHEF is VAT registered, set by the Super Admin under Settings. */
+export async function getVat() {
+    const [row] = await db.select().from(siteSettings).where(eq(siteSettings.key, "vat_config")).limit(1);
+    const value = (row?.value ?? {}) as { registered?: boolean; rate?: unknown };
+    const rate = Number(value.rate ?? 20);
+    return { registered: value.registered === true, rate: Number.isFinite(rate) && rate >= 0 && rate <= 30 ? rate : 20 };
+}
+
 export const splitPayout = (gross: number, percent: number) => {
     const commission = roundMoney(gross * (percent / 100));
     return { gross: roundMoney(gross), commission, net: roundMoney(gross - commission) };
@@ -62,11 +70,16 @@ async function chefSnapshot(chefId: number) {
 
 async function createInvoice(input: {
     chefId: number; kind: "order" | "event"; sourceKey: string; description: string;
-    gross: number; percent: number; orderId?: number | null; progressId?: number | null; quoteId?: number | null;
+    gross: number; percent: number; tip?: number; orderId?: number | null; progressId?: number | null; quoteId?: number | null;
 }) {
     const [existing] = await db.select().from(chefInvoices).where(eq(chefInvoices.sourceKey, input.sourceKey)).limit(1);
     if (existing) return existing;
-    const { gross, commission, net } = splitPayout(input.gross, input.percent);
+    const { gross, commission, net: beforeTip } = splitPayout(input.gross, input.percent);
+    const tip = roundMoney(input.tip ?? 0);
+    const net = roundMoney(beforeTip + tip);
+    // When MYUKCHEF is VAT registered, the commission includes VAT, and the invoice shows how much.
+    const vat = await getVat();
+    const commissionVat = vat.registered ? roundMoney(commission * (vat.rate / (100 + vat.rate))) : 0;
     const snapshot = await chefSnapshot(input.chefId);
     try {
         const [{ id }] = await db.insert(chefInvoices).values({
@@ -81,6 +94,8 @@ async function createInvoice(input: {
             grossAmount: gross,
             commissionPercent: input.percent,
             commissionAmount: commission,
+            commissionVat,
+            tipAmount: tip,
             netAmount: net,
             chefDetails: snapshot.details,
         }).$returningId();
@@ -95,7 +110,7 @@ async function createInvoice(input: {
         await notifyChef(
             input.chefId,
             `Invoice ${invoice.number} is ready`,
-            `${input.description}: £${net.toFixed(2)} after MYUKCHEF's ${input.percent}% commission. Please check and submit it so we can pay you.`,
+            `${input.description}: £${net.toFixed(2)} after MYUKCHEF's ${input.percent}% commission${tip ? `, including a £${tip.toFixed(2)} tip` : ""}. Please check and submit it so we can pay you.`,
             "/chef/dashboard?tab=payouts",
         );
     }
@@ -114,10 +129,11 @@ export async function raiseOrderInvoice(progressId: number, { force = false } = 
     const percent = part.commissionPercent ?? (await getPayoutRules()).percent;
     const gross = part.grossAmount ?? part.payoutAmount ?? 0;
     const { net } = splitPayout(gross, percent);
-    await db.update(orderChefProgress).set({ commissionPercent: percent, grossAmount: gross, payoutAmount: net }).where(eq(orderChefProgress.id, part.id));
+    const tip = part.tipAmount ?? 0;
+    await db.update(orderChefProgress).set({ commissionPercent: percent, grossAmount: gross, payoutAmount: roundMoney(net + tip) }).where(eq(orderChefProgress.id, part.id));
     return createInvoice({
         chefId: part.chefId, kind: "order", sourceKey: `order:${part.id}`,
-        description: `Order #${order.id}`, gross, percent, orderId: order.id, progressId: part.id,
+        description: `Order #${order.id}`, gross, percent, tip, orderId: order.id, progressId: part.id,
     });
 }
 
@@ -279,7 +295,9 @@ export async function invoiceForViewer(invoiceId: number, viewer: { chefId: numb
     if (!invoice || (!viewer.admin && invoice.chefId !== viewer.chefId)) throw fail(404, "Invoice not found");
     const [named] = await withChefName([invoice]);
     const [company] = await db.select().from(siteSettings).where(eq(siteSettings.key, "company_info")).limit(1);
-    return { ...named, platform: company?.value ?? null };
+    const [vat] = await db.select().from(siteSettings).where(eq(siteSettings.key, "vat_config")).limit(1);
+    const vatNumber = (vat?.value as { registered?: boolean; number?: string } | undefined)?.registered ? (vat?.value as { number?: string }).number : undefined;
+    return { ...named, platform: { ...((company?.value as object) ?? {}), ...(vatNumber ? { vatNumber } : {}) } };
 }
 
 // === Background jobs ===

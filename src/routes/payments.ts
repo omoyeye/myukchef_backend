@@ -5,6 +5,7 @@ import { db } from "../db";
 import { orders } from "../db/schema";
 import { settlePayment } from "../lib/orderPlaced";
 import { checkoutOutcome, verifyWebhook } from "../lib/payments";
+import { settleBookingSession } from "../lib/bookingPayments";
 
 /**
  * POST /api/payments/stripe/webhook. Stripe tells us when a checkout is paid or runs out.
@@ -21,6 +22,8 @@ export async function stripeWebhook(req: Request, res: Response) {
         if (event.type === "checkout.session.completed" || event.type === "checkout.session.async_payment_succeeded"
             || event.type === "checkout.session.expired" || event.type === "checkout.session.async_payment_failed") {
             const session = event.data.object as Stripe.Checkout.Session;
+            // Event bookings and meal plan deliveries are settled by their own code.
+            if (await settleBookingSession(session)) return res.json({ received: true });
             const { outcome, paymentIntentId, orderId } = await checkoutOutcome(session);
             const failed = event.type === "checkout.session.expired" || event.type === "checkout.session.async_payment_failed";
             if (orderId) {

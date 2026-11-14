@@ -6,6 +6,7 @@ import { sendNotificationEmail } from "./mail";
 import { notify, notifyAdmins, notifyChef } from "./notify";
 import { getPayoutRules, raiseOrderInvoice, splitPayout, voidOrderInvoices } from "./chefPayouts";
 import { refundOrder } from "./payments";
+import { rewardReferral } from "./accounts";
 import { getOrderSettings } from "./pricing";
 import { sendSMS } from "./sms";
 
@@ -29,10 +30,11 @@ export interface ChefProgress {
     customerConfirmedAt: Date | null;
     customerIssue: string | null;
     payoutAmount: number | null;
+    tipAmount: number;
     payoutStatus: string;
     paidAt: Date | null;
 }
-const EMPTY_EVIDENCE = { progressId: null, deliveryProof: null, deliveredAt: null, customerConfirmedAt: null, customerIssue: null, payoutAmount: null, payoutStatus: "pending", paidAt: null };
+const EMPTY_EVIDENCE = { progressId: null, deliveryProof: null, deliveredAt: null, customerConfirmedAt: null, customerIssue: null, payoutAmount: null, tipAmount: 0, payoutStatus: "pending", paidAt: null };
 const PROOF_PHOTO = /^\/uploads\/[\w-]+\.(jpg|jpeg|png|webp|gif)$/;
 type OrderRow = typeof orders.$inferSelect;
 
@@ -73,6 +75,7 @@ export async function progressForOrders(list: { id: number; status: string }[]) 
                     customerConfirmedAt: row.customerConfirmedAt,
                     customerIssue: row.customerIssue,
                     payoutAmount: row.payoutAmount,
+                    tipAmount: row.tipAmount ?? 0,
                     payoutStatus: row.payoutStatus,
                     paidAt: row.paidAt,
                 };
@@ -118,9 +121,11 @@ async function orderStageChanged(order: OrderRow, next: string) {
         .where(eq(orders.id, order.id));
     // Loyalty points are earned once, when an order is first completed.
     if (next === "completed" && order.status !== "completed" && order.userId) {
+        // First delivered order from someone a friend referred: both get their points.
+        rewardReferral(order.userId).catch((e) => console.error("Referral reward failed:", e));
         const { loyalty } = await getOrderSettings();
         if (loyalty.enabled) {
-            const earned = Math.floor(order.total * loyalty.earnRatio);
+            const earned = Math.floor((order.total - (order.tipAmount ?? 0)) * loyalty.earnRatio);
             await db.update(users).set({ points: sql`${users.points} + ${earned}` }).where(eq(users.id, order.userId));
         }
     }
@@ -147,6 +152,23 @@ async function chefShare(orderId: number, chefId: number) {
     return Math.round(Number(row?.total ?? 0) * 100) / 100;
 }
 
+/** This chef's share of the tip: in proportion to their dishes among all the chefs' dishes in the order. */
+async function tipShare(order: OrderRow, chefId: number) {
+    if (!order.tipAmount) return 0;
+    const rows = await db.select({
+        chefId: sql<number | null>`coalesce(${chefProducts.chefId}, ${products.chefId})`,
+        total: sql<number>`sum(${orderItems.price} * ${orderItems.quantity})`,
+    }).from(orderItems)
+        .leftJoin(chefProducts, eq(orderItems.chefProductId, chefProducts.id))
+        .leftJoin(products, eq(orderItems.productId, products.id))
+        .where(eq(orderItems.orderId, order.id))
+        .groupBy(sql`coalesce(${chefProducts.chefId}, ${products.chefId})`);
+    const chefsOnly = rows.filter((r) => r.chefId !== null);
+    const all = chefsOnly.reduce((sum, r) => sum + Number(r.total), 0);
+    const mine = Number(chefsOnly.find((r) => Number(r.chefId) === chefId)?.total ?? 0);
+    return all > 0 ? Math.round(order.tipAmount * (mine / all) * 100) / 100 : 0;
+}
+
 /** A chef moves their part of an order one step on, and the customer hears about it straight away. */
 export async function moveChefStage(orderId: number, chefId: number, next: unknown, proof?: unknown) {
     const [order] = await db.select().from(orders).where(eq(orders.id, orderId)).limit(1);
@@ -170,11 +192,13 @@ export async function moveChefStage(orderId: number, chefId: number, next: unkno
     // The chef's sales, less MYUKCHEF's commission. Fixed now, so a later change to the rate can't alter it.
     const split = delivered ? splitPayout(await chefShare(orderId, chefId), (await getPayoutRules()).percent) : null;
     const commissionPercent = delivered ? (await getPayoutRules()).percent : null;
-    const payoutAmount = split?.net ?? null;
+    // The customer's tip is shared between the order's chefs by how much each one cooked, with no commission.
+    const tipAmount = delivered ? await tipShare(order, chefId) : 0;
+    const payoutAmount = split ? Math.round((split.net + tipAmount) * 100) / 100 : null;
     await db.update(orderChefProgress).set({
         status: next,
         updatedAt: new Date(),
-        ...(delivered ? { deliveryProof: proof as string, deliveredAt: new Date(), grossAmount: split!.gross, commissionPercent, payoutAmount, payoutStatus: "pending" } : {}),
+        ...(delivered ? { deliveryProof: proof as string, deliveredAt: new Date(), grossAmount: split!.gross, commissionPercent, tipAmount, payoutAmount, payoutStatus: "pending" } : {}),
     }).where(and(eq(orderChefProgress.orderId, orderId), eq(orderChefProgress.chefId, chefId)));
     mine.status = next;
 
@@ -276,26 +300,43 @@ export async function releaseDisputedDelivery(progressId: number) {
     return invoice;
 }
 
+/**
+ * Cancels an order and refunds a card payment. Super Admins can cancel at any point; customers can
+ * cancel their own order only until a chef has started cooking.
+ */
+export async function cancelOrder(order: OrderRow, by: "customer" | "admin") {
+    if (order.status === "cancelled") return order;
+    if (by === "customer") {
+        const started = (await progressForOrder(order)).some((p) => p.status !== "received");
+        if (!["received", "awaiting_payment"].includes(order.status) || started) {
+            throw Object.assign(new Error("Your chef has already started on this order, so it can't be cancelled here. Email us if something's wrong."), { status: 400 });
+        }
+    }
+    // A card payment is refunded first; if Stripe refuses, the order stays as it is.
+    const refunded = await refundOrder(order);
+    await orderStageChanged(order, "cancelled");
+    await db.update(orders).set({ cancelledBy: by, ...(order.paymentStatus === "awaiting" ? { paymentStatus: "failed" } : {}) }).where(eq(orders.id, order.id));
+    await voidOrderInvoices(order.id, `Order #${order.id} was cancelled${refunded ? " and refunded" : ""}, so this invoice won't be paid.`);
+    // Chefs never saw an unpaid order, so there's nothing to tell them.
+    if (order.status !== "awaiting_payment") {
+        for (const p of await progressForOrder(order)) {
+            await notifyChef(p.chefId, `Order #${order.id} was cancelled`, by === "customer" ? "The customer cancelled before you started. You don't need to prepare it." : "You no longer need to prepare this order.", "/chef/dashboard?tab=orders");
+        }
+        if (by === "customer") await notifyAdmins(`Order #${order.id} cancelled by the customer`, refunded ? `£${order.total.toFixed(2)} was refunded to their card.` : "No payment had been taken.", "/admin/orders");
+    }
+    await notifyCustomer(order, `Order #${order.id} cancelled`, refunded
+        ? `Your order #${order.id} has been cancelled and your payment of £${order.total.toFixed(2)} refunded to your card. It can take 5 to 10 days to show.`
+        : `Your order #${order.id} has been cancelled.${by === "admin" ? " Contact us if you have any questions." : ""}`);
+    const [updated] = await db.select().from(orders).where(eq(orders.id, order.id)).limit(1);
+    return updated!;
+}
+
 /** Super Admins don't move orders through kitchens, but they can cancel one or reopen it. */
 export async function adminSetOrderStatus(orderId: number, status: unknown) {
     const [order] = await db.select().from(orders).where(eq(orders.id, orderId)).limit(1);
     if (!order) throw Object.assign(new Error("Order not found"), { status: 404 });
     if (status === "cancelled") {
-        if (order.status === "cancelled") return order;
-        // A card payment is refunded first; if Stripe refuses, the order stays as it is.
-        const refunded = await refundOrder(order);
-        await orderStageChanged(order, "cancelled");
-        await voidOrderInvoices(order.id, `Order #${order.id} was cancelled${refunded ? " and refunded" : ""}, so this invoice won't be paid.`);
-        if (order.paymentStatus === "awaiting") await db.update(orders).set({ paymentStatus: "failed" }).where(eq(orders.id, order.id));
-        // Chefs never saw an unpaid order, so there's nothing to tell them.
-        if (order.status !== "awaiting_payment") {
-            for (const p of await progressForOrder(order)) {
-                await notifyChef(p.chefId, `Order #${order.id} was cancelled`, "You no longer need to prepare this order.", "/chef/dashboard?tab=orders");
-            }
-        }
-        await notifyCustomer(order, `Order #${order.id} cancelled`, refunded
-            ? `Your order #${order.id} has been cancelled and your payment of £${order.total.toFixed(2)} refunded to your card. It can take 5 to 10 days to show.`
-            : `Your order #${order.id} has been cancelled. Contact us if you have any questions.`);
+        return cancelOrder(order, "admin");
     } else if (status === "received") {
         if (order.status !== "cancelled") throw Object.assign(new Error("Only a cancelled order can be reopened."), { status: 400 });
         if (["refunded", "failed", "awaiting"].includes(order.paymentStatus)) {

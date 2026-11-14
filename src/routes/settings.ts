@@ -8,7 +8,7 @@ import { cleanTiers } from "../lib/pricing";
 const router = Router();
 
 // Staff-only settings are left out of what the public site receives.
-const PRIVATE_KEYS = new Set(["admin_alert_email", "sms_sender", "event_commission", "company_bank_details", "allergens_14_migrated"]);
+const PRIVATE_KEYS = new Set(["admin_alert_email", "sms_sender", "event_commission", "company_bank_details", "allergens_14_migrated", "selling_rules", "vat_config", "chef_commission"]);
 
 // GET /api/settings
 router.get("/", async (req, res) => {

@@ -1,3 +1,5 @@
+import { chefForMenu, sellingChefs } from "../lib/selling";
+import { filterDishes, pageOf } from "../lib/search";
 import { Router } from "express";
 import { db } from "../db";
 import { products, chefProducts, chefs, users } from "../db/schema";
@@ -22,10 +24,22 @@ async function chefIdFrom(value: unknown) {
 // GET /products
 router.get("/", async (req, res) => {
     try {
-        const rows = await db.select({ product: products, chef: chefBrief }).from(products).leftJoin(chefs, eq(products.chefId, chefs.id));
+        const rows = await db.select({ product: products }).from(products);
         // Dishes stay off sale until their allergens are confirmed. Admins still see them to fix them.
         const admin = await isAdmin(getUserId(req));
-        res.json(rows.filter((r) => admin || r.product.allergensDeclared).map((r) => ({ ...r.product, chef: r.chef })));
+        // A dish cooked by a chef follows that chef's rules: allowed to sell, opening times and notice.
+        const sellers = await sellingChefs();
+        const everyChef = admin ? new Map((await db.select().from(chefs)).map((c) => [c.id, c])) : sellers;
+        const now = new Date();
+        let dishes = rows
+            .filter((r) => admin || (r.product.allergensDeclared && (r.product.chefId === null || sellers.has(r.product.chefId))))
+            .map((r) => {
+                const chef = r.product.chefId !== null ? everyChef.get(r.product.chefId) : undefined;
+                return { ...r.product, noticeHours: chef?.noticeHours ?? 0, chef: chef ? chefForMenu(chef, now) : null };
+            });
+        if (!admin) dishes = filterDishes(dishes, req.query);
+        res.setHeader("X-Total-Count", String(dishes.length));
+        res.json(admin ? dishes : pageOf(dishes, req.query));
     } catch (error) {
         console.error("Get products error:", error);
         res.status(500).json({ error: "Internal server error" });
@@ -39,7 +53,8 @@ router.get("/:id", async (req, res) => {
         const [row] = await db.select({ product: products, chef: chefBrief }).from(products).leftJoin(chefs, eq(products.chefId, chefs.id)).where(eq(products.id, id)).limit(1);
 
         if (row && (row.product.allergensDeclared || (await isAdmin(getUserId(req))))) {
-            return res.json({ ...row.product, chef: row.chef });
+            const [chef] = row.product.chefId !== null ? await db.select().from(chefs).where(eq(chefs.id, row.product.chefId)).limit(1) : [];
+            return res.json({ ...row.product, noticeHours: chef?.noticeHours ?? 0, chef: chef ? chefForMenu(chef) : row.chef });
         }
 
         // Menu pages link chef dishes here too, but only approved ones are public.
@@ -49,14 +64,15 @@ router.get("/:id", async (req, res) => {
             .where(and(eq(chefProducts.id, id), eq(chefProducts.status, "approved"), eq(chefProducts.allergensDeclared, true), eq(chefs.status, "approved")))
             .limit(1);
 
-        if (!chefDish) {
+        if (!chefDish || !(await sellingChefs([chefDish.chef.id])).has(chefDish.chef.id)) {
             return res.status(404).json({ error: "Product not found" });
         }
 
         res.json({
             ...chefDish.product,
+            noticeHours: Math.max(chefDish.product.noticeHours ?? 0, chefDish.chef.noticeHours),
             modifiers: [],
-            chef: { id: chefDish.chef.id, displayName: chefDish.chef.displayName, avatar: chefDish.chef.avatar },
+            chef: chefForMenu(chefDish.chef),
         });
     } catch (error) {
         console.error("Get product error:", error);

@@ -3,6 +3,10 @@ import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
 import crypto from 'crypto';
+import sharp from 'sharp';
+
+/** Uploaded photos are never stored wider or taller than this. */
+const MAX_IMAGE_WIDTH = 1600;
 import { eq } from 'drizzle-orm';
 import { db } from '../db';
 import { users } from '../db/schema';
@@ -44,7 +48,7 @@ const upload = multer({
     storage: storage,
     fileFilter: fileFilter,
     limits: {
-        fileSize: 5 * 1024 * 1024 // 5MB limit
+        fileSize: 12 * 1024 * 1024 // 12MB: phone photos are large, and they're shrunk after upload
     }
 });
 
@@ -58,15 +62,31 @@ const requireUploader = async (req: express.Request, res: express.Response, next
     } catch (error) { next(error); }
 };
 
-router.post('/', requireAuth, requireUploader, upload.single('image'), (req, res) => {
+router.post('/', requireAuth, requireUploader, upload.single('image'), async (req, res) => {
     try {
         if (!req.file) {
             return res.status(400).json({ error: 'No file uploaded' });
         }
 
-        // Return the URL for the uploaded file
+        // Phone photos are several megabytes. Each one is turned the right way up, shrunk to a
+        // sensible size and saved as WebP, which is usually a tenth of the size.
+        let filename = req.file.filename;
+        if (req.file.mimetype !== 'image/gif') {
+            const optimised = `${path.parse(filename).name}.webp`;
+            try {
+                await sharp(req.file.path).rotate().resize({ width: MAX_IMAGE_WIDTH, height: MAX_IMAGE_WIDTH, fit: 'inside', withoutEnlargement: true }).webp({ quality: 80 }).toFile(path.join(uploadDir, `tmp-${optimised}`));
+                await fs.promises.unlink(req.file.path).catch(() => undefined);
+                await fs.promises.rename(path.join(uploadDir, `tmp-${optimised}`), path.join(uploadDir, optimised));
+                filename = optimised;
+            } catch {
+                await fs.promises.unlink(req.file.path).catch(() => undefined);
+                await fs.promises.unlink(path.join(uploadDir, `tmp-${optimised}`)).catch(() => undefined);
+                return res.status(400).json({ error: "We couldn't read that image. Please try a JPG or PNG." });
+            }
+        }
+
         // Note: The /uploads prefix matches the static route in index.ts
-        const imageUrl = `/uploads/${req.file.filename}`;
+        const imageUrl = `/uploads/${filename}`;
         res.json({ url: imageUrl });
     } catch (error: any) {
         console.error('Upload error:', error);
@@ -108,6 +128,37 @@ router.post('/video', requireAuth, requireUploader, videoUpload.single('video'),
         res.json({ url: `/uploads/${req.file.filename}`, seconds: Math.round(seconds) });
     } catch (error) { next(error); }
 });
+
+// === Small versions for cards and lists ===
+const THUMB_DIR = path.join(uploadDir, '.thumbs');
+const THUMB_WIDTHS = [240, 480, 960];
+const UPLOADED_IMAGE = /^[\w-]+\.(jpg|jpeg|png|webp)$/;
+
+/**
+ * GET /uploads/sm/:file?w=480: a small WebP copy of an uploaded image, made the first time it's
+ * asked for and kept. Cards and lists use these, so a menu page doesn't download full-size photos.
+ */
+export async function serveThumbnail(req: express.Request, res: express.Response) {
+    const file = String(req.params.file ?? '');
+    if (!UPLOADED_IMAGE.test(file)) return res.status(404).end();
+    const wanted = Number(req.query.w) || 480;
+    const width = THUMB_WIDTHS.find((w) => w >= wanted) ?? THUMB_WIDTHS[THUMB_WIDTHS.length - 1]!;
+    const source = path.join(uploadDir, file);
+    const target = path.join(THUMB_DIR, `${path.parse(file).name}-${width}.webp`);
+    try {
+        if (!fs.existsSync(target)) {
+            if (!fs.existsSync(source)) return res.status(404).end();
+            await fs.promises.mkdir(THUMB_DIR, { recursive: true });
+            await sharp(source).rotate().resize({ width, withoutEnlargement: true }).webp({ quality: 72 }).toFile(`${target}.tmp`);
+            await fs.promises.rename(`${target}.tmp`, target);
+        }
+        res.setHeader('Cache-Control', 'public, max-age=2592000, immutable');
+        res.type('image/webp').sendFile(target, { dotfiles: 'allow' });
+    } catch {
+        // If anything goes wrong, the full image still works.
+        res.redirect(`/uploads/${file}`);
+    }
+}
 
 // === Private documents ===
 // Certificates and other compliance evidence. Kept outside the public uploads folder and only

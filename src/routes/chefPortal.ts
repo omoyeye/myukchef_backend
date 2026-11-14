@@ -51,6 +51,8 @@ router.get("/orders", async (req, res) => {
     type Line = { name: string; quantity: number; price: number; notes: string | null; allergens: string[] };
     type ChefOrder = {
         id: number; status: string; myStatus: string; createdAt: Date; area: string | null; method: string;
+        /** When the customer wants it, and this chef's share of any tip (once delivered). */
+        scheduledFor: Date | null; tipAmount: number;
         customerName: string | null; deliveryAddress: { line1?: string; city?: string; postcode?: string; notes?: string } | null;
         otherChefs: number; items: Line[];
         payoutAmount: number | null; payoutStatus: string | null; deliveryProof: string | null;
@@ -68,6 +70,8 @@ router.get("/orders", async (req, res) => {
                 status: order.status,
                 myStatus: order.status,
                 createdAt: order.createdAt,
+                scheduledFor: order.scheduledFor,
+                tipAmount: 0,
                 area: publicArea(address.postcode ?? null),
                 method: address.method === "pickup" ? "pickup" : "delivery",
                 customerName: address.firstName ?? null,
@@ -93,6 +97,7 @@ router.get("/orders", async (req, res) => {
         o.myStatus = o.status === "cancelled" ? "cancelled" : mine?.status ?? o.status;
         if (mine?.status === "completed") {
             o.payoutAmount = mine.payoutAmount;
+            o.tipAmount = mine.tipAmount ?? 0;
             o.payoutStatus = mine.payoutStatus;
             o.deliveryProof = mine.deliveryProof;
             o.customerConfirmedAt = mine.customerConfirmedAt;

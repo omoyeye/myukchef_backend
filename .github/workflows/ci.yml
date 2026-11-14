@@ -1,0 +1,52 @@
+# Checks every push and pull request: types, unit tests, and the full integration suite against a
+# throwaway MySQL database. A red cross on GitHub means something broke before it reached the server.
+name: Checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -proot"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Types
+        run: npm run typecheck
+      - name: Unit tests
+        run: npm test
+        env:
+          DATABASE_URL: mysql://unused:unused@127.0.0.1:1/unused
+      - name: Integration tests
+        run: npm run test:integration
+        env:
+          TEST_DATABASE_URL: mysql://root:root@127.0.0.1:3306/myukchef_test
+          DATABASE_URL: mysql://root:root@127.0.0.1:3306/myukchef_test
+      - name: Build
+        run: npm run build

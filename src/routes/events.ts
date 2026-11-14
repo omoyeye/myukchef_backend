@@ -3,6 +3,7 @@ import { and, asc, desc, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
 import { chefCompliance, chefInvoices, chefProducts, chefs, eventQuoteMessages, eventQuotes, events, products, QuoteItem, users } from "../db/schema";
 import { markInvoicePaid, raiseEventInvoice } from "../lib/chefPayouts";
+import { markEventPaid, refreshBookingPayment, refundEventCard, startEventCheckout } from "../lib/bookingPayments";
 import { getUserId, isAdmin, requireAdmin, requireAuth } from "../lib/auth";
 import { assertNoContactDetails } from "../lib/contactGuard";
 import { getBankDetails, getCommissionPercent, notifyAdmins, paymentReference, refreshQuoteStage, roundMoney } from "../lib/eventQuotes";
@@ -259,20 +260,13 @@ router.post("/admin/:id/payment", requireAdmin, async (req, res) => {
     if (!event) throw notFound();
     const status = req.body.status;
     if (status === "paid") {
-        if (event.status !== "awaiting_payment") throw badRequest("The customer needs to confirm their quotes first");
-        // The split is fixed now, so later changes to the commission setting can't alter this booking.
-        const commissionPercent = await getCommissionPercent();
-        const accepted = await db.select().from(eventQuotes).where(and(eq(eventQuotes.eventId, event.id), eq(eventQuotes.status, "accepted")));
-        for (const quote of accepted) {
-            await db.update(eventQuotes).set({ commissionPercent, payoutAmount: roundMoney((quote.total ?? 0) * (1 - commissionPercent / 100)), payoutStatus: "pending" }).where(eq(eventQuotes.id, quote.id));
-            await notifyChef(quote.chefId, "Booking paid: you're confirmed", `${event.eventName} is paid in full. You can now see the venue, date and time. Your payout follows from MYUKCHEF.`, "/chef/dashboard?tab=bookings");
-        }
-        await db.update(events).set({ paymentStatus: "paid", paidAt: new Date(), status: "confirmed" }).where(eq(events.id, event.id));
-        await notify(event.userId, "Payment received", `Thank you. ${event.eventName} is confirmed and your chefs have been told.`, `/my-bookings/${event.id}`, "event");
+        await markEventPaid(event.id);
     } else if (status === "refunded") {
         if (event.paymentStatus !== "paid") throw badRequest("Only a paid booking can be refunded");
         const paidOut = await db.select({ id: eventQuotes.id }).from(eventQuotes).where(and(eq(eventQuotes.eventId, event.id), eq(eventQuotes.payoutStatus, "paid"))).limit(1);
         if (paidOut.length > 0) throw badRequest("A chef has already been paid for this booking. Reverse that payout first.");
+        // A card payment goes back to the card automatically; a bank transfer you send back yourself.
+        await refundEventCard(event);
         await db.update(eventQuotes).set({ payoutStatus: "cancelled" }).where(eq(eventQuotes.eventId, event.id));
         await db.update(events).set({ paymentStatus: "refunded", status: "cancelled" }).where(eq(events.id, event.id));
         await notify(event.userId, "Your booking was refunded", `${event.eventName} has been cancelled and refunded.`, `/my-bookings/${event.id}`, "event");
@@ -317,6 +311,16 @@ router.patch("/admin/quotes/:quoteId", requireAdmin, async (req, res) => {
     }
     const [updated] = await db.select().from(eventQuotes).where(eq(eventQuotes.id, quote.id)).limit(1);
     res.json(updated);
+});
+
+// POST /events/:id/pay-by-card: Stripe's payment page for a booking that's waiting for payment
+router.post("/:id/pay-by-card", requireAuth, async (req, res) => {
+    res.json(await startEventCheckout(Number(req.params.id), getUserId(req)));
+});
+
+// POST /events/:id/payment-status: checks with Stripe when the customer comes back from paying
+router.post("/:id/payment-status", requireAuth, async (req, res) => {
+    res.json(await refreshBookingPayment("event", Number(req.params.id), getUserId(req)));
 });
 
 // === CUSTOMER, ONE BOOKING ===

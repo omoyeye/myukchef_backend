@@ -1,4 +1,5 @@
 import crypto from "crypto";
+import { afterSignUp, confirmEmail, referralSummary, sendVerificationEmail } from "../lib/accounts";
 import { Router } from "express";
 import bcrypt from "bcrypt";
 import { and, eq, gt } from "drizzle-orm";
@@ -13,6 +14,8 @@ const router = Router();
 
 const loginLimit = rateLimit(10, 60_000, "Too many attempts. Please wait a minute and try again.");
 const accountLimit = rateLimit(5, 60_000, "Too many attempts. Please wait a minute and try again.");
+// Email links are signed, so they can't be guessed; this only stops a page being hammered.
+const verifyLimit = rateLimit(20, 60_000, "Too many attempts. Please wait a minute and try again.");
 
 const hashResetToken = (token: string) => crypto.createHash("sha256").update(token).digest("hex");
 
@@ -59,6 +62,8 @@ router.post("/register", accountLimit, async (req, res) => {
         const [newUser] = await db.select().from(users).where(eq(users.id, id)).limit(1);
 
         sendWelcomeEmail(newUser.email, newUser.name).catch((err: unknown) => console.error("Welcome email failed:", err));
+        // Their own referral code, who referred them, and the "confirm your email" link.
+        await afterSignUp(newUser, req.body.referralCode);
 
         await db.insert(notifications).values({
             userId: newUser.id,
@@ -73,6 +78,27 @@ router.post("/register", accountLimit, async (req, res) => {
         console.error("Register error:", error);
         res.status(500).json({ error: "Internal server error" });
     }
+});
+
+// POST /auth/verify-email { token }: the link from the confirmation email
+router.post("/verify-email", verifyLimit, async (req, res, next) => {
+    try { res.json(await confirmEmail(req.body?.token)); } catch (error) { next(error); }
+});
+
+// POST /auth/resend-verification: sends the confirmation email again
+router.post("/resend-verification", requireAuth, accountLimit, async (req, res, next) => {
+    try {
+        const [user] = await db.select().from(users).where(eq(users.id, getUserId(req))).limit(1);
+        if (!user) return res.status(404).json({ error: "Account not found" });
+        if (user.emailVerifiedAt) return res.json({ sent: false, verified: true });
+        await sendVerificationEmail(user);
+        res.json({ sent: true });
+    } catch (error) { next(error); }
+});
+
+// GET /auth/referral: the person's code and how many friends have joined
+router.get("/referral", requireAuth, async (req, res, next) => {
+    try { res.json(await referralSummary(getUserId(req))); } catch (error) { next(error); }
 });
 
 // GET /auth/me/export: everything held about this person, as a file

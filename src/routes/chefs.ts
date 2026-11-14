@@ -3,6 +3,10 @@ import fs from "fs";
 import path from "path";
 import { addCredential, CREDENTIAL_TYPES, deleteCredential, hasVerifiedHygiene, listForChef, publicCredentials, reviewCredential, updateCredential } from "../lib/credentials";
 import { privateFilePath } from "./upload";
+import { availabilitySummary, cleanOpeningHours } from "../lib/availability";
+import { chefForMenu, chefTimes, sellingChefs } from "../lib/selling";
+import { filterDishes, pageOf } from "../lib/search";
+import { afterSignUp } from "../lib/accounts";
 import { db } from "../db";
 import { chefCompliance, chefCredentials, chefInvoices, chefReviews, chefs, chefProducts, eventQuotes, events, favouriteChefs, mealPlans, mealPlanWeeks, orderItems, orders, products, users } from "../db/schema";
 import { eq, and, desc, inArray, sql } from "drizzle-orm";
@@ -22,6 +26,14 @@ const publicChef = <T extends { phone: unknown; userId: unknown; rejectionReason
     // Payout account details are private too.
     const { phone: _p, userId: _u, rejectionReason: _r, latitude, longitude, stripeAccountId: _s, stripePayoutsEnabled: _e, ...rest } = chef as T & { stripeAccountId?: unknown; stripePayoutsEnabled?: unknown };
     return { ...rest, location: publicArea(chef.location), approxLat: blurCoordinate(latitude), approxLng: blurCoordinate(longitude) };
+};
+
+/** Extra warning a dish needs, in hours. Empty means the chef's usual notice. */
+const dishNotice = (value: unknown) => {
+    if (value === undefined || value === null || value === "") return null;
+    const hours = Number(value);
+    if (!Number.isInteger(hours) || hours < 0 || hours > 168) throw Object.assign(new Error("Notice must be between 0 hours and 7 days."), { status: 400 });
+    return hours;
 };
 
 /** Only videos uploaded through MYUKCHEF can be shown on a chef's page. */
@@ -100,6 +112,7 @@ router.post("/register", rateLimit(5, 60_000), async (req, res) => {
         const hashed = await bcrypt.hash(password, 10);
         const [{ id: newUserId }] = await db.insert(users).values({ name, email, password: hashed, role: "chef", termsAcceptedAt: new Date() }).$returningId();
         const [newUser] = await db.select().from(users).where(eq(users.id, newUserId)).limit(1);
+        await afterSignUp(newUser, req.body.referralCode);
 
         const [{ id: newChefId }] = await db.insert(chefs).values({
             userId: newUser.id,
@@ -180,12 +193,19 @@ router.delete("/:id/favourite", async (req, res, next) => {
 // GET /chefs — public: only approved chefs
 router.get("/", async (req, res) => {
     try {
-        const all = await db.select().from(chefs).where(eq(chefs.status, "approved")).orderBy(desc(chefs.approvedAt));
+        const approved = await db.select().from(chefs).where(eq(chefs.status, "approved")).orderBy(desc(chefs.approvedAt));
+        // ?q= searches the chef's name, cuisine, area and bio.
+        const words = (typeof req.query.q === "string" ? req.query.q : "").toLowerCase().split(/\s+/).filter(Boolean).slice(0, 8);
+        const all = words.length
+            ? approved.filter((c) => { const hay = [c.displayName, c.specialty, c.location, c.bio].join(" ").toLowerCase(); return words.every((w) => hay.includes(w)); })
+            : approved;
         const stats = await chefStats(all.map((c) => c.id));
         const creds = await publicCredentials(all.map((c) => c.id));
-        const badges = (id: number) => ({ hygieneVerified: (creds.get(id) ?? []).some((c) => c.type === "food_hygiene"), verifiedCredentials: (creds.get(id) ?? []).length });
+        const byId = new Map(all.map((c) => [c.id, c]));
+        const badges = (id: number) => ({ hygieneVerified: (creds.get(id) ?? []).some((c) => c.type === "food_hygiene"), verifiedCredentials: (creds.get(id) ?? []).length, ...availabilitySummary(chefTimes(byId.get(id)!)) });
         const origin = parseCoordinates(req.query.lat, req.query.lng);
-        if (!origin) return res.json(all.map((chef) => ({ ...publicChef(chef), ...stats.get(chef.id), ...badges(chef.id) })));
+        res.setHeader("X-Total-Count", String(all.length));
+        if (!origin) return res.json(pageOf(all.map((chef) => ({ ...publicChef(chef), ...stats.get(chef.id), ...badges(chef.id) })), req.query));
 
         const withDistance = all.map((chef) => {
             const distanceMiles = chef.latitude !== null && chef.longitude !== null
@@ -197,7 +217,7 @@ router.get("/", async (req, res) => {
         withDistance.sort((a, b) =>
             Number(b.inServiceArea) - Number(a.inServiceArea) ||
             (a.distanceMiles ?? Infinity) - (b.distanceMiles ?? Infinity));
-        res.json(withDistance);
+        res.json(pageOf(withDistance, req.query));
     } catch (error) {
         console.error("Get chefs error:", error);
         res.status(500).json({ error: "Internal server error" });
@@ -245,7 +265,13 @@ router.put("/me", async (req, res) => {
         assertNoContactDetails(req.body.displayName, req.body.bio, req.body.specialty, req.body.story);
 
         const { displayName, bio, specialty, avatar, coverImage, phone, location, yearsExperience, isAvailableForEvents, eventRate, serviceRadiusMiles, acceptsMealPlans } = req.body;
+        const notice = req.body.noticeHours !== undefined ? Number(req.body.noticeHours) : chef.noticeHours;
+        if (!Number.isInteger(notice) || notice < 0 || notice > 168) return res.status(400).json({ error: "Notice must be between 0 hours and 7 days." });
         await db.update(chefs).set({
+            // When the chef cooks one-off orders.
+            ...(req.body.openingHours !== undefined ? { openingHours: cleanOpeningHours(req.body.openingHours) } : {}),
+            ...(req.body.ordersPaused !== undefined ? { ordersPaused: !!req.body.ordersPaused } : {}),
+            noticeHours: notice,
             displayName: displayName ?? chef.displayName,
             bio: bio ?? chef.bio,
             ...storyAndVideo(req.body, chef),
@@ -325,16 +351,21 @@ router.delete("/:id", async (req, res) => {
 // === CHEF PRODUCTS ===
 
 // GET /chefs/products/public — all approved products from approved chefs
-router.get("/products/public", async (_req, res) => {
+router.get("/products/public", async (req, res) => {
     try {
-        const rows = await db.select({
-            product: chefProducts,
-            chef: chefs,
-        })
+        const rows = await db.select({ product: chefProducts })
             .from(chefProducts)
-            .innerJoin(chefs, eq(chefProducts.chefId, chefs.id))
-            .where(and(eq(chefProducts.status, "approved"), eq(chefProducts.allergensDeclared, true), eq(chefs.status, "approved")));
-        res.json(rows.map((r) => ({ ...r.product, chef: { id: r.chef.id, displayName: r.chef.displayName, avatar: r.chef.avatar } })));
+            .where(and(eq(chefProducts.status, "approved"), eq(chefProducts.allergensDeclared, true)));
+        // Only chefs allowed to sell: approved, and hygiene-verified when that rule is on.
+        const sellers = await sellingChefs();
+        const now = new Date();
+        let dishes = rows.filter((r) => sellers.has(r.product.chefId)).map((r) => {
+            const chef = sellers.get(r.product.chefId)!;
+            return { ...r.product, noticeHours: Math.max(r.product.noticeHours ?? 0, chef.noticeHours), chef: chefForMenu(chef, now) };
+        });
+        dishes = filterDishes(dishes, req.query);
+        res.setHeader("X-Total-Count", String(dishes.length));
+        res.json(pageOf(dishes, req.query));
     } catch (error) {
         console.error("Public chef products error:", error);
         res.status(500).json({ error: "Internal server error" });
@@ -381,6 +412,7 @@ router.post("/me/products", async (req, res) => {
             allergensDeclared: !!allergensDeclared,
             isVegetarian: !!isVegetarian, isVegan: !!isVegan, isGlutenFree: !!isGlutenFree, isHalal: !!isHalal, isPopular: !!isPopular,
             calories: calories ? Number(calories) : null,
+            noticeHours: dishNotice(req.body.noticeHours),
             status: "pending",
         });
         const [created] = await db.select().from(chefProducts).where(eq(chefProducts.id, id)).limit(1);
@@ -412,6 +444,7 @@ router.put("/me/products/:id", async (req, res) => {
             isVegetarian: !!isVegetarian, isVegan: !!isVegan, isGlutenFree: !!isGlutenFree, isHalal: !!isHalal, isPopular: !!isPopular,
             calories: calories ? Number(calories) : null,
             isSoldOut: !!isSoldOut,
+            noticeHours: dishNotice(req.body.noticeHours),
             status: "pending", // re-moderate after edits
         }).where(eq(chefProducts.id, id));
         const [updated] = await db.select().from(chefProducts).where(eq(chefProducts.id, id)).limit(1);
@@ -749,12 +782,13 @@ router.get("/:id", async (req, res, next) => {
         const [chef] = await db.select().from(chefs).where(and(eq(chefs.id, id), eq(chefs.status, "approved"))).limit(1);
         if (!chef) return res.status(404).json({ error: "Chef not found" });
         const stats = await chefStats([id]);
+        const selling = (await sellingChefs([id])).has(id);
         const userId = getUserId(req);
         const favourite = userId
             ? (await db.select({ id: favouriteChefs.chefId }).from(favouriteChefs).where(and(eq(favouriteChefs.userId, userId), eq(favouriteChefs.chefId, id))).limit(1)).length > 0
             : false;
         const credentials = (await publicCredentials([id])).get(id) ?? [];
-        res.json({ ...publicChef(chef), ...stats.get(id), favourite, credentials, hygieneVerified: credentials.some((c) => c.type === "food_hygiene") });
+        res.json({ ...publicChef(chef), ...stats.get(id), favourite, credentials, hygieneVerified: credentials.some((c) => c.type === "food_hygiene"), selling, ...availabilitySummary(chefTimes(chef)) });
     } catch (error) { next(error); }
 });
 

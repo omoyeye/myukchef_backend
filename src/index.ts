@@ -6,7 +6,7 @@ import path from "path";
 import "./db"; // loads .env before anything below reads it
 
 import { authenticate } from "./lib/auth";
-import { UPLOAD_DIR } from "./routes/upload";
+import { serveThumbnail, UPLOAD_DIR } from "./routes/upload";
 import { startRetentionJobs } from "./lib/accountData";
 import { migrateAllergens } from "./lib/allergens";
 import { startEventJobs } from "./lib/eventQuotes";
@@ -23,6 +23,8 @@ import { discountsRouter } from "./routes/discounts";
 import { eventsRouter } from "./routes/events";
 import { integrationsRouter } from "./routes/integrations";
 import { payoutsRouter } from "./routes/payouts";
+import { healthRouter, reportServerError } from "./routes/health";
+import { reportsRouter } from "./routes/reports";
 import { startPayoutJobs } from "./lib/chefPayouts";
 import { startCredentialJobs } from "./lib/credentials";
 import { stripeWebhook } from "./routes/payments";
@@ -42,6 +44,22 @@ const app = express();
 const port = process.env.PORT || 3000;
 const isProduction = process.env.NODE_ENV === "production";
 
+const CONTENT_SECURITY_POLICY = [
+    "default-src 'self'",
+    "script-src 'self' https://maps.googleapis.com",
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+    "font-src 'self' data: https://fonts.gstatic.com",
+    "img-src 'self' data: blob: https:",
+    "media-src 'self' blob:",
+    "connect-src 'self' https://maps.googleapis.com https://*.googleapis.com",
+    "worker-src 'self' blob:",
+    "manifest-src 'self'",
+    "frame-ancestors 'self'",
+    "form-action 'self' https://checkout.stripe.com",
+    "base-uri 'self'",
+    "object-src 'none'",
+].join("; ");
+
 app.set("trust proxy", 1);
 app.disable("x-powered-by");
 app.use(compression());
@@ -49,7 +67,10 @@ app.use((_req, res, next) => {
     res.setHeader("X-Content-Type-Options", "nosniff");
     res.setHeader("X-Frame-Options", "SAMEORIGIN");
     res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
-    res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=(self)");
+    res.setHeader("Permissions-Policy", "camera=(self), microphone=(), geolocation=(self)");
+    // Only our own scripts run, plus Google Maps once the visitor agrees to it. This limits the damage if a
+    // malicious script ever reaches a page. Images may come from anywhere over HTTPS (dish photos).
+    res.setHeader("Content-Security-Policy", CONTENT_SECURITY_POLICY);
     if (isProduction) res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
     next();
 });
@@ -81,9 +102,13 @@ app.use("/api/users", usersRouter);
 app.use("/api/location", locationRouter);
 app.use("/api/admin/integrations", integrationsRouter);
 app.use("/api/payouts", payoutsRouter);
+app.use("/api/health", healthRouter);
+app.use("/api/reports", reportsRouter);
 app.use("/api", (_req, res) => res.status(404).json({ error: "Not found" }));
 
-app.use("/uploads", express.static(UPLOAD_DIR, { maxAge: "30d" }));
+app.get("/uploads/sm/:file", serveThumbnail);
+// Dot folders (the thumbnail cache) aren't served directly.
+app.use("/uploads", express.static(UPLOAD_DIR, { maxAge: "30d", dotfiles: "ignore" }));
 // A missing upload is a 404, not the website's home page.
 app.use("/uploads", (_req, res) => res.status(404).end());
 
@@ -121,6 +146,7 @@ app.use((error: Error & { status?: number; code?: string }, _req: Request, res: 
     if (error.status && error.status < 500) return res.status(error.status).json({ error: error.message });
     if (error.name === "MulterError") return res.status(400).json({ error: error.message });
     console.error("Unhandled error:", error);
+    reportServerError(error, `${_req.method} ${_req.path}`);
     res.status(500).json({ error: "Internal server error" });
 });
 

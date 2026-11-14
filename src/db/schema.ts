@@ -1,4 +1,4 @@
-import { mysqlTable, serial, text, varchar, int, timestamp, boolean, json, double, primaryKey, date, unique } from "drizzle-orm/mysql-core";
+import { mysqlTable, serial, text, varchar, int, timestamp, boolean, json, double, primaryKey, date, unique, index } from "drizzle-orm/mysql-core";
 import { relations } from "drizzle-orm";
 
 export const users = mysqlTable("users", {
@@ -9,8 +9,20 @@ export const users = mysqlTable("users", {
     role: text("role").default("customer").notNull(), // 'admin' | 'customer' | 'chef'
     points: int("points").default(0).notNull(),
     termsAcceptedAt: timestamp("terms_accepted_at"),
+    // Set when the person clicks the link in their confirmation email.
+    emailVerifiedAt: timestamp("email_verified_at"),
+    // Refer a friend: each person's own code, who referred them, and when both were rewarded.
+    // Built from the account number, so it is always unique. (Not a unique column: adding one to a
+    // table that already has people in it makes the database tool offer to empty the table.)
+    referralCode: varchar("referral_code", { length: 12 }),
+    referredBy: int("referred_by"),
+    referralRewardedAt: timestamp("referral_rewarded_at"),
     createdAt: timestamp("created_at").defaultNow().notNull(),
-});
+}, (t) => ({ byReferral: index("users_referral_idx").on(t.referralCode) }));
+
+/** One day's opening times, in UK time, as "HH:MM". */
+export interface DayHours { open: boolean; from: string; to: string }
+export type OpeningHours = Partial<Record<"mon" | "tue" | "wed" | "thu" | "fri" | "sat" | "sun", DayHours>>;
 
 // === CHEF SYSTEM ===
 export const chefs = mysqlTable("chefs", {
@@ -41,6 +53,12 @@ export const chefs = mysqlTable("chefs", {
     isAvailableForEvents: boolean("is_available_for_events").default(true).notNull(),
     eventRate: double("event_rate"),
     acceptsMealPlans: boolean("accepts_meal_plans").default(true).notNull(),
+    // When the chef cooks one-off orders. Empty means any time.
+    openingHours: json("opening_hours").$type<OpeningHours>(),
+    // The chef's own switch to stop new one-off orders for now (holiday, too busy).
+    ordersPaused: boolean("orders_paused").default(false).notNull(),
+    // How much warning the chef needs before an order is due, unless a dish says otherwise.
+    noticeHours: int("notice_hours").default(1).notNull(),
     // Set by an admin after checking the Food Standards Agency listing, never by the chef.
     hygieneRating: int("hygiene_rating"),
     agreementAcceptedAt: timestamp("agreement_accepted_at"),
@@ -67,6 +85,8 @@ export const chefProducts = mysqlTable("chef_products", {
     isPopular: boolean("is_popular").default(false),
     isSoldOut: boolean("is_sold_out").default(false),
     status: text("status").default("pending").notNull(), // pending | approved | rejected
+    // Warning this dish needs, when it's more than the chef's usual (for example slow-cooked dishes).
+    noticeHours: int("notice_hours"),
     calories: int("calories"),
     createdAt: timestamp("created_at").defaultNow().notNull(),
 });
@@ -94,6 +114,9 @@ export const events = mysqlTable("events", {
     finalTotal: double("final_total"), // What the customer pays: the quotes they chose, added together
     paymentStatus: varchar("payment_status", { length: 20 }).default("unpaid").notNull(), // unpaid | submitted | paid | refunded
     paidAt: timestamp("paid_at"),
+    // Set when the customer pays by card instead of bank transfer.
+    stripeSessionId: varchar("stripe_session_id", { length: 255 }),
+    stripePaymentIntentId: varchar("stripe_payment_intent_id", { length: 255 }),
     createdAt: timestamp("created_at").defaultNow().notNull(),
 });
 
@@ -181,8 +204,13 @@ export const orders = mysqlTable("orders", {
     stripePaymentIntentId: varchar("stripe_payment_intent_id", { length: 255 }),
     paidAt: timestamp("paid_at"),
     refundedAt: timestamp("refunded_at"),
+    // When the customer wants it delivered or ready to collect.
+    scheduledFor: timestamp("scheduled_for"),
+    // A tip for the chefs, on top of the total. It goes to them in full, with no commission.
+    tipAmount: double("tip_amount").default(0).notNull(),
+    cancelledBy: varchar("cancelled_by", { length: 20 }), // customer | admin | system
     createdAt: timestamp("created_at").defaultNow().notNull(),
-});
+}, (t) => ({ byCreated: index("orders_created_idx").on(t.createdAt) }));
 
 export const orderItems = mysqlTable("order_items", {
     id: int("id").autoincrement().primaryKey(),
@@ -214,10 +242,12 @@ export const orderChefProgress = mysqlTable("order_chef_progress", {
     // The chef's dishes at the prices paid, MYUKCHEF's commission, and what the chef receives.
     grossAmount: double("gross_amount"),
     commissionPercent: double("commission_percent"),
+    // This chef's share of the customer's tip, paid in full on top of their sales.
+    tipAmount: double("tip_amount").default(0).notNull(),
     payoutAmount: double("payout_amount"),
     payoutStatus: varchar("payout_status", { length: 20 }).default("pending").notNull(), // pending | paid
     paidAt: timestamp("paid_at"),
-}, (t) => ({ oneEach: unique("order_chef_unique").on(t.orderId, t.chefId) }));
+}, (t) => ({ oneEach: unique("order_chef_unique").on(t.orderId, t.chefId), byStatus: index("progress_status_idx").on(t.status, t.deliveredAt) }));
 
 // An invoice MYUKCHEF raises for each delivered order part or attended event. The chef checks and
 // submits it, MYUKCHEF pays them (automatically through Stripe where it can), and a receipt is issued.
@@ -235,6 +265,10 @@ export const chefInvoices = mysqlTable("chef_invoices", {
     grossAmount: double("gross_amount").notNull(),
     commissionPercent: double("commission_percent").notNull(),
     commissionAmount: double("commission_amount").notNull(),
+    // The part of the commission that is VAT, when MYUKCHEF is VAT registered (shown on the invoice).
+    commissionVat: double("commission_vat").default(0).notNull(),
+    // The customer's tip for this chef, added in full.
+    tipAmount: double("tip_amount").default(0).notNull(),
     netAmount: double("net_amount").notNull(),
     // awaiting_chef | submitted | processing | paid | held | void
     status: varchar("status", { length: 20 }).default("awaiting_chef").notNull(),
@@ -250,7 +284,18 @@ export const chefInvoices = mysqlTable("chef_invoices", {
     payoutError: text("payout_error"),
     receiptNumber: varchar("receipt_number", { length: 32 }).unique(),
     createdAt: timestamp("created_at").defaultNow().notNull(),
-});
+}, (t) => ({ byStatus: index("invoices_status_idx").on(t.status) }));
+
+// Messages between a customer and one of the chefs cooking their order ("I'm outside", "no onions please").
+export const orderMessages = mysqlTable("order_messages", {
+    id: int("id").autoincrement().primaryKey(),
+    orderId: int("order_id").references(() => orders.id, { onDelete: "cascade" }).notNull(),
+    chefId: int("chef_id").references(() => chefs.id, { onDelete: "cascade" }).notNull(),
+    senderId: int("sender_id").references(() => users.id, { onDelete: "set null" }),
+    senderRole: varchar("sender_role", { length: 10 }).notNull(), // customer | chef
+    body: text("body").notNull(),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+}, (t) => ({ byThread: index("order_messages_thread_idx").on(t.orderId, t.chefId, t.createdAt) }));
 
 // Evidence a chef is trained and checked: food hygiene certificates, council registration, insurance,
 // a DBS check. A Super Admin verifies each one; verified ones can show on the chef's public page.
@@ -273,7 +318,7 @@ export const chefCredentials = mysqlTable("chef_credentials", {
     showOnProfile: boolean("show_on_profile").default(true).notNull(),
     createdAt: timestamp("created_at").defaultNow().notNull(),
     updatedAt: timestamp("updated_at").defaultNow().notNull(),
-});
+}, (t) => ({ byStatus: index("credentials_status_idx").on(t.status) }));
 
 export const passwordResetTokens = mysqlTable("password_reset_tokens", {
     id: int("id").autoincrement().primaryKey(),
@@ -393,7 +438,7 @@ export const notifications = mysqlTable("notifications", {
     link: text("link"), // Optional link to a page (e.g. /order-tracker/123)
     isRead: boolean("is_read").default(false).notNull(),
     createdAt: timestamp("created_at").defaultNow().notNull(),
-});
+}, (t) => ({ byUser: index("notifications_user_idx").on(t.userId, t.createdAt) }));
 
 export const notificationsRelations = relations(notifications, ({ one }) => ({
     user: one(users, {
@@ -471,6 +516,10 @@ export const mealPlanWeeks = mysqlTable("meal_plan_weeks", {
     deliveryFee: double("delivery_fee").default(0).notNull(),
     total: double("total").default(0).notNull(),
     isPaid: boolean("is_paid").default(false).notNull(),
+    // Set when the customer pays this delivery by card.
+    stripeSessionId: varchar("stripe_session_id", { length: 255 }),
+    stripePaymentIntentId: varchar("stripe_payment_intent_id", { length: 255 }),
+    paidAt: timestamp("paid_at"),
     lockReminderSent: boolean("lock_reminder_sent").default(false).notNull(),
 }, (t) => ({ planWeek: unique("plan_week_unique").on(t.planId, t.weekNumber) }));
 

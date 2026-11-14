@@ -28,6 +28,11 @@ The API listens on the `PORT` in `.env` (3002 in the example) under `/api`.
 | `npm run db:push` | Bring the database up to date with `src/db/schema.ts` |
 | `npm run db:seed` | Create the Super Admin account |
 | `npm run push:keys` | Make the keys for website push notifications |
+| `npm test` | Unit tests (no database needed) |
+| `npm run test:integration` | The full test suite against a throwaway database: set `TEST_DATABASE_URL` to a database whose name contains "test" (it is wiped each run) |
+| `npm run backup` | Back up the database and uploads (see DIRECTADMIN_DEPLOYMENT.md for the nightly job) |
+
+Every push to GitHub runs the types, both test suites and a build (see `.github/workflows/ci.yml`). A red cross on a commit means something broke.
 
 ## Payments and email
 

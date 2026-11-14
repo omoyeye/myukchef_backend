@@ -3,6 +3,7 @@ import { and, asc, desc, eq, gte, inArray, lte, ne } from "drizzle-orm";
 import { db } from "../db";
 import { chefReviews, chefs, mealPlanMessages, mealPlans, mealPlanWeeks, users } from "../db/schema";
 import { getUserId, isAdmin, requireAdmin, requireAuth } from "../lib/auth";
+import { refreshBookingPayment, startWeekCheckout } from "../lib/bookingPayments";
 import { geocode, milesBetween, publicArea } from "../lib/geo";
 import {
     addDays, addPoints, ALLERGENS, completeIfFinished, DELIVERY_WINDOWS, DIETARY, DURATIONS, eligibleDishes, getPlanConfig, isLocked,
@@ -503,6 +504,16 @@ router.patch("/:id/weeks/:weekId/status", requireAuth, async (req, res) => {
     }
     await completeIfFinished(plan.id);
     res.json({ status });
+});
+
+// POST /meal-plans/:id/weeks/:weekId/pay: Stripe's payment page for one delivery
+router.post("/:id/weeks/:weekId/pay", requireAuth, async (req, res) => {
+    res.json(await startWeekCheckout(Number(req.params.id), Number(req.params.weekId), getUserId(req)));
+});
+
+// POST /meal-plans/:id/weeks/:weekId/payment-status: checks with Stripe when the customer comes back
+router.post("/:id/weeks/:weekId/payment-status", requireAuth, async (req, res) => {
+    res.json(await refreshBookingPayment("plan_week", Number(req.params.weekId), getUserId(req)));
 });
 
 // PATCH /meal-plans/:id/weeks/:weekId/payment: admins record that a delivery has been paid

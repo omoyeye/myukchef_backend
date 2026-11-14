@@ -41,9 +41,33 @@ function verifyToken(token: string): number | null {
     const given = Buffer.from(signature);
     if (expected.length !== given.length || !crypto.timingSafeEqual(expected, given)) return null;
     try {
-        const { sub, exp } = JSON.parse(Buffer.from(payload, "base64url").toString());
+        const { sub, exp, purpose } = JSON.parse(Buffer.from(payload, "base64url").toString());
+        // Links sent by email (purpose tokens) must never work as a sign-in.
+        if (purpose !== undefined) return null;
         if (typeof sub !== "number" || typeof exp !== "number" || exp < Date.now() / 1000) return null;
         return sub;
+    } catch {
+        return null;
+    }
+}
+
+/** A signed link for one job only, such as confirming an email address. */
+export function signPurposeToken(userId: number, purpose: string, lifetimeSeconds: number) {
+    const exp = Math.floor(Date.now() / 1000) + lifetimeSeconds;
+    const payload = Buffer.from(JSON.stringify({ sub: userId, exp, purpose })).toString("base64url");
+    return `${payload}.${sign(payload)}`;
+}
+
+export function verifyPurposeToken(token: string, purpose: string): number | null {
+    const [payload, signature] = token.split(".");
+    if (!payload || !signature) return null;
+    const expected = Buffer.from(sign(payload));
+    const given = Buffer.from(signature);
+    if (expected.length !== given.length || !crypto.timingSafeEqual(expected, given)) return null;
+    try {
+        const data = JSON.parse(Buffer.from(payload, "base64url").toString());
+        if (data.purpose !== purpose || typeof data.sub !== "number" || typeof data.exp !== "number" || data.exp < Date.now() / 1000) return null;
+        return data.sub;
     } catch {
         return null;
     }

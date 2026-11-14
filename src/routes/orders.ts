@@ -4,13 +4,38 @@ import { db } from "../db";
 import { orders, orderItems, products, chefProducts, chefs, users } from "../db/schema";
 import { and, eq, desc, inArray, notInArray } from "drizzle-orm";
 import { announceNewOrder, refreshPayment } from "../lib/orderPlaced";
-import { adminSetOrderStatus, confirmDelivery, progressForOrder, progressForOrders } from "../lib/orderProgress";
+import { adminSetOrderStatus, cancelOrder, confirmDelivery, progressForOrder, progressForOrders } from "../lib/orderProgress";
+import { rateLimit } from "../lib/rateLimit";
 import { paymentConfig, startCheckout } from "../lib/payments";
+import { availableSlots, MAX_DAYS_AHEAD, problemWith, type BasketChef } from "../lib/availability";
+import { chefTimes, sellingChefs } from "../lib/selling";
+import { listThreads, postMessage } from "../lib/orderMessages";
+
+/** The chefs behind a basket, each with the longest notice any of their dishes needs. */
+async function basketChefs(itemIds: string[]) {
+    const ids = [...new Set(itemIds.filter((id) => typeof id === "string"))].slice(0, 100);
+    if (!ids.length) return { basket: [] as BasketChef[], unavailable: [] as string[] };
+    const menu = await db.select({ id: products.id, chefId: products.chefId }).from(products).where(inArray(products.id, ids));
+    const chefDishes = await db.select({ id: chefProducts.id, chefId: chefProducts.chefId, noticeHours: chefProducts.noticeHours }).from(chefProducts).where(inArray(chefProducts.id, ids));
+    const lines = [...menu.map((m) => ({ ...m, noticeHours: null as number | null })), ...chefDishes].filter((l) => l.chefId !== null) as { id: string; chefId: number; noticeHours: number | null }[];
+    const sellers = await sellingChefs([...new Set(lines.map((l) => l.chefId))]);
+    const byChef = new Map<number, BasketChef>();
+    const unavailable: string[] = [];
+    for (const line of lines) {
+        const chef = sellers.get(line.chefId);
+        if (!chef) { unavailable.push(line.id); continue; }
+        const current = byChef.get(chef.id) ?? { chef: chefTimes(chef), noticeHours: chef.noticeHours };
+        current.noticeHours = Math.max(current.noticeHours, line.noticeHours ?? 0);
+        byChef.set(chef.id, current);
+    }
+    return { basket: [...byChef.values()], unavailable };
+}
 import { getUserId, isAdmin, requireAdmin } from "../lib/auth";
 import { geocode, parseCoordinates } from "../lib/geo";
 import { badRequest, calculateTotals, getOrderSettings, validateDiscount } from "../lib/pricing";
 
 const router = Router();
+const messageLimit = rateLimit(30, 60_000);
 
 // Pages read item.product whichever table the dish came from.
 const withDish = <T extends { product: unknown; chefProduct: unknown }>({ chefProduct, ...item }: T) => ({
@@ -29,6 +54,35 @@ router.post("/:id/confirm-delivery", async (req, res, next) => {
     try {
         res.json(await confirmDelivery(Number(req.params.id), { userId: getUserId(req), token: req.body?.t }, req.body?.received !== false, req.body?.issue));
     } catch (error) { next(error); }
+});
+
+// POST /orders/slots { itemIds }: the delivery times that suit every chef in the basket
+router.post("/slots", async (req, res, next) => {
+    try {
+        const { basket } = await basketChefs(Array.isArray(req.body?.itemIds) ? req.body.itemIds : []);
+        const { slots, reason } = availableSlots(basket);
+        res.json({ slots, earliest: slots[0] ?? null, reason, noticeHours: Math.max(0, ...basket.map((b) => b.noticeHours)) });
+    } catch (error) { next(error); }
+});
+
+// POST /orders/:id/cancel { t? }: the customer changes their mind before cooking starts
+router.post("/:id/cancel", async (req, res, next) => {
+    try {
+        const [order] = await db.select().from(orders).where(eq(orders.id, Number(req.params.id))).limit(1);
+        if (!order) return res.status(404).json({ error: "Order not found" });
+        const viewerId = getUserId(req);
+        const owns = (!!order.trackingToken && req.body?.t === order.trackingToken) || (!!viewerId && order.userId === viewerId);
+        if (!owns) return res.status(403).json({ error: "Open this order from your account or your order email." });
+        res.json(await cancelOrder(order, "customer"));
+    } catch (error) { next(error); }
+});
+
+// GET /orders/:id/messages?t=  and  POST /orders/:id/messages { chefId, body, t? }
+router.get("/:id/messages", async (req, res, next) => {
+    try { res.json(await listThreads(Number(req.params.id), { userId: getUserId(req), token: req.query.t })); } catch (error) { next(error); }
+});
+router.post("/:id/messages", messageLimit, async (req, res, next) => {
+    try { res.status(201).json(await postMessage(Number(req.params.id), { userId: getUserId(req), token: req.body?.t }, req.body?.chefId, req.body?.body)); } catch (error) { next(error); }
 });
 
 // GET /orders/payment-config: whether checkout takes card payments
@@ -281,6 +335,30 @@ router.post("/", async (req, res) => {
             .innerJoin(chefs, eq(chefProducts.chefId, chefs.id))
             .where(and(inArray(chefProducts.id, productIds), eq(chefProducts.status, "approved"), eq(chefProducts.allergensDeclared, true), eq(chefs.status, "approved")));
 
+        // Every chef in the basket must be allowed to sell, taking orders, and able to cook for the chosen time.
+        const { basket, unavailable } = await basketChefs(productIds);
+        if (unavailable.length) {
+            const gone = items.find((i: any) => unavailable.includes(i.menuItem.id));
+            throw badRequest(`Sorry, ${gone?.menuItem?.name || "an item in your cart"} is no longer available.`);
+        }
+        let scheduledFor: Date | null = null;
+        if (basket.length) {
+            if (req.body.scheduledFor) {
+                scheduledFor = new Date(req.body.scheduledFor);
+                if (Number.isNaN(scheduledFor.getTime())) throw badRequest("Please choose a delivery time.");
+                if (scheduledFor.getTime() > Date.now() + MAX_DAYS_AHEAD * 86400_000) throw badRequest(`Orders can be placed up to ${MAX_DAYS_AHEAD} days ahead.`);
+                for (const b of basket) {
+                    const problem = problemWith(b.chef, scheduledFor, b.noticeHours);
+                    if (problem) throw badRequest(problem);
+                }
+            } else {
+                // "As soon as possible": the first time that suits every chef.
+                const { slots, reason } = availableSlots(basket, new Date(), 1);
+                if (!slots.length) throw badRequest(reason ?? "These chefs aren't taking orders right now.");
+                scheduledFor = new Date(slots[0]!);
+            }
+        }
+
         const productMap = new Map<string, { id: string; name: string; price: number; isSoldOut: boolean | null; isChefDish: boolean; allergens: string[] | null; chefId: number | null; modifiers?: any[] | null }>([
             ...dbProducts.map(p => [p.id, { ...p, isChefDish: false }] as [string, typeof p & { isChefDish: boolean }]),
             ...dbChefProducts.map(p => [p.id, { ...p, isChefDish: true }] as [string, typeof p & { isChefDish: boolean }]),
@@ -320,7 +398,10 @@ router.post("/", async (req, res) => {
             throw badRequest(`The minimum order for delivery is £${orderSettings.delivery.minOrder.toFixed(2)}.`);
         }
         const discount = discountCode ? await validateDiscount(String(discountCode), subtotal, userId ?? 0) : null;
-        const { total: serverCalculatedTotal } = calculateTotals(subtotal, deliveryMethod, orderSettings.delivery, discount);
+        const { total: beforeTip } = calculateTotals(subtotal, deliveryMethod, orderSettings.delivery, discount);
+        // A tip goes to the chefs in full, on top of the total.
+        const tip = Math.round(Math.min(Math.max(Number(req.body.tip) || 0, 0), 200) * 100) / 100;
+        const serverCalculatedTotal = Math.round((beforeTip + tip) * 100) / 100;
 
         // 4. Create Order
         const { cardPayments } = await paymentConfig();
@@ -336,6 +417,8 @@ router.post("/", async (req, res) => {
             trackingToken: crypto.randomBytes(16).toString('hex'),
             userId: userId ? Number(userId) : null,
             total: serverCalculatedTotal,
+            tipAmount: tip,
+            scheduledFor,
             deliveryAddress: { ...deliveryAddress, method: deliveryMethod, discountCode: discount?.code ?? null },
             // With card payments on, nobody hears about the order until Stripe says it's paid.
             status: cardPayments ? "awaiting_payment" : "received",

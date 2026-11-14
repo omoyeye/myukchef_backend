@@ -2,7 +2,7 @@ import crypto from "crypto";
 import bcrypt from "bcrypt";
 import { eq, ne } from "drizzle-orm";
 import { db } from "./db";
-import { chefProducts, chefs, products, users } from "./db/schema";
+import { chefProducts, chefs, products, users, chefCredentials } from "./db/schema";
 import { demoChefs, demoDishChefs, demoDishes } from "./demo-dishes";
 import { migrateAllergens } from "./lib/allergens";
 
@@ -49,6 +49,11 @@ async function seed() {
             await db.insert(chefs).values({ ...profile, userId: account.id, status: "approved", approvedAt: new Date() })
                 .onDuplicateKeyUpdate({ set: { displayName: profile.displayName, status: "approved" } });
             const [chef] = await db.select({ id: chefs.id }).from(chefs).where(eq(chefs.userId, account.id)).limit(1);
+            // A sample verified hygiene certificate, so the sample dishes are on sale (see Settings, Selling rules).
+            const [hasCert] = await db.select({ id: chefCredentials.id }).from(chefCredentials).where(eq(chefCredentials.chefId, chef.id)).limit(1);
+            if (!hasCert) {
+                await db.insert(chefCredentials).values({ chefId: chef.id, type: "food_hygiene", title: "Level 2 Food Hygiene and Safety (sample)", issuer: "Sample data", level: "2", issuedOn: new Date().toISOString().slice(0, 10), status: "verified", verifiedAt: new Date() });
+            }
             for (const dish of dishes) {
                 await db.insert(chefProducts).values({ ...dish, chefId: chef.id }).onDuplicateKeyUpdate({ set: { name: dish.name, price: dish.price, status: "approved", allergens: dish.allergens, allergensDeclared: true } });
             }
