@@ -118,7 +118,7 @@ export const sendNotificationEmail = async (to: string, title: string, message: 
 };
 
 /** Sends a template that only goes by email (welcome, password reset and so on). */
-async function sendTemplateEmail(key: string, to: string, vars: Record<string, unknown>, opts: { button?: { label: string; url: string }; extraHtml?: string; senderName?: string; replyTo?: string } = {}) {
+export async function sendTemplateEmail(key: string, to: string, vars: Record<string, unknown>, opts: { button?: { label: string; url: string }; extraHtml?: string; senderName?: string; replyTo?: string } = {}) {
     const c = await resolveContent(key, vars);
     if (!c.channels.email) return;
     const b = await getBrand();

@@ -6,7 +6,31 @@ import { notify } from "./notify";
 import { ALLERGENS as ALL_ALLERGENS } from "./allergens";
 import { badRequest, getOrderSettings } from "./pricing";
 
-export const DURATIONS: Record<number, number> = { 1: 4, 3: 13, 6: 26 }; // Months to weekly deliveries
+/** The old fixed lengths, in weekly deliveries. Still accepted from older app versions. */
+export const DURATIONS: Record<number, number> = { 1: 4, 3: 13, 6: 26 };
+/** Plans can be any length from one week to six months. */
+export const MIN_WEEKS = 1;
+export const MAX_WEEKS = 26;
+/** Quick choices shown in the plan builder. Any length in between can be picked too. */
+export const PRESET_WEEKS = [1, 2, 4, 8, 13, 26];
+
+/** "1 week", "6 weeks", "3 months"; or as a describing word ("a 6 week plan"). Whole-month lengths read as months. */
+export function planLength(weeks: number, describing = false) {
+    const months = weeks === 4 ? 1 : weeks === 8 ? 2 : weeks === 13 ? 3 : weeks === 26 ? 6 : 0;
+    if (months) return `${months} month${months === 1 || describing ? "" : "s"}`;
+    return `${weeks} week${weeks === 1 || describing ? "" : "s"}`;
+}
+/** The length in months, rounded, for older app versions that only understand months. */
+export const monthsFor = (weeks: number) => Math.max(1, Math.round(weeks / 4.345));
+/** How many weekly deliveries a plan has. Plans made before flexible lengths only have months. */
+export const planWeeks = (plan: { durationWeeks: number | null; durationMonths: number }) => plan.durationWeeks ?? DURATIONS[plan.durationMonths] ?? plan.durationMonths * 4;
+/** Longer plans save more: from 4 weeks, 13 weeks (3 months) and 26 weeks (6 months). */
+export function discountFor(weeks: number, discounts: Record<number, number>) {
+    if (weeks >= 26) return discounts[6] ?? 0;
+    if (weeks >= 13) return discounts[3] ?? 0;
+    if (weeks >= 4) return discounts[1] ?? 0;
+    return 0;
+}
 export const MEAL_OPTIONS = [3, 5, 7, 10, 14];
 export const SERVING_OPTIONS = [1, 2, 3, 4, 6];
 export const DELIVERY_WINDOWS = ["morning", "afternoon", "evening"];
@@ -195,7 +219,14 @@ export async function runMealPlanJobs() {
     }
 }
 
+/** Plans made before flexible lengths get their length in weeks filled in, once. */
+async function fillPlanWeeks() {
+    await db.update(mealPlans).set({ durationWeeks: sql`case ${mealPlans.durationMonths} when 1 then 4 when 3 then 13 when 6 then 26 else ${mealPlans.durationMonths} * 4 end` })
+        .where(sql`${mealPlans.durationWeeks} is null`);
+}
+
 export function startMealPlanJobs() {
+    fillPlanWeeks().catch((e) => console.error("Filling plan lengths failed:", e));
     const run = () => runMealPlanJobs().catch((e) => console.error("Meal plan jobs failed:", e));
     run();
     setInterval(run, 60 * 60 * 1000).unref();

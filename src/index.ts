@@ -27,8 +27,12 @@ import { payoutsRouter } from "./routes/payouts";
 import { healthRouter, reportServerError } from "./routes/health";
 import { reportsRouter } from "./routes/reports";
 import templatesRouter from "./routes/templates";
+import postsRouter from "./routes/posts";
+import bannersRouter from "./routes/banners";
+import { trackRequests } from "./lib/metrics";
 import { startPayoutJobs } from "./lib/chefPayouts";
 import { startCredentialJobs } from "./lib/credentials";
+import { startWeeklyReports } from "./lib/weeklyReports";
 import { stripeWebhook } from "./routes/payments";
 import { releaseStaleUnpaidOrders } from "./lib/orderPlaced";
 import { locationRouter } from "./routes/location";
@@ -53,6 +57,7 @@ const CONTENT_SECURITY_POLICY = [
     "font-src 'self' data: https://fonts.gstatic.com",
     "img-src 'self' data: blob: https:",
     "media-src 'self' blob:",
+    "frame-src https://www.youtube-nocookie.com https://www.youtube.com",
     "connect-src 'self' https://maps.googleapis.com https://*.googleapis.com",
     "worker-src 'self' blob:",
     "manifest-src 'self'",
@@ -65,6 +70,7 @@ const CONTENT_SECURITY_POLICY = [
 app.set("trust proxy", 1);
 app.disable("x-powered-by");
 app.use(compression());
+app.use(trackRequests);
 app.use((_req, res, next) => {
     res.setHeader("X-Content-Type-Options", "nosniff");
     res.setHeader("X-Frame-Options", "SAMEORIGIN");
@@ -107,6 +113,8 @@ app.use("/api/payouts", payoutsRouter);
 app.use("/api/health", healthRouter);
 app.use("/api/reports", reportsRouter);
 app.use("/api/admin/templates", templatesRouter);
+app.use("/api/posts", postsRouter);
+app.use("/api/banners", bannersRouter);
 app.use("/api", (_req, res) => res.status(404).json({ error: "Not found" }));
 
 app.get("/uploads/sm/:file", serveThumbnail);
@@ -160,6 +168,7 @@ app.listen(port, () => {
     startRetentionJobs();
     startPayoutJobs();
     startCredentialJobs();
+    startWeeklyReports();
     // Unpaid orders whose payment page ran out are released, in case Stripe's webhook didn't arrive.
     setInterval(() => releaseStaleUnpaidOrders().catch((e) => console.error("Unpaid order check failed:", e)), 15 * 60 * 1000).unref();
     migrateAllergens()

@@ -86,8 +86,8 @@ export const TEMPLATES: TemplateDef[] = [
         "This order was reopened. Please prepare it again."),
 
     // ===== Meal plans =====
-    t("plan.request_sent", "Meal plans", "customer", "Plan request sent", ["chefName", "months"], "We've sent your request",
-        "{{chefName}} will confirm your {{months}} month plan. Nothing is charged yet."),
+    t("plan.request_sent", "Meal plans", "customer", "Plan request sent", ["chefName", "length", "weeks", "months"], "We've sent your request",
+        "{{chefName}} will confirm your {{length}} plan. Nothing is charged yet."),
     t("plan.confirmed", "Meal plans", "customer", "Plan confirmed", ["note"], "Your meal plan is confirmed",
         "Your chef has accepted your plan. You can now change, skip or pause any week before its cut-off."),
     t("plan.declined", "Meal plans", "customer", "Chef can't take the plan", ["note"], "Your chef can't take this plan",
@@ -106,9 +106,9 @@ export const TEMPLATES: TemplateDef[] = [
     t("plan.ending_soon", "Meal plans", "customer", "Plan ends soon", ["endDate"], "Your meal plan ends soon",
         "Your plan finishes on {{endDate}}. It won't renew by itself, so renew it if you'd like to carry on."),
     t("plan.finished", "Meal plans", "customer", "Plan finished", [], "Your meal plan has finished",
-        "Hope you enjoyed it. You can renew it with your chef in one tap, and tell others how it went."),
-    t("plan.request_chef", "Meal plans", "chef", "New plan request", ["months", "mealsPerWeek", "servings", "startDate"], "New meal plan request",
-        "A customer would like a {{months}} month plan: {{mealsPerWeek}} meals a week for {{servings}}. Please reply before {{startDate}}."),
+        "Hope you enjoyed it. You can order it again with your chef in one tap from My meal plans, and tell others how it went."),
+    t("plan.request_chef", "Meal plans", "chef", "New plan request", ["length", "weeks", "months", "mealsPerWeek", "servings", "startDate"], "New meal plan request",
+        "A customer would like a {{length}} plan: {{mealsPerWeek}} meals a week for {{servings}}. Please reply before {{startDate}}."),
     t("plan.status_updated_chef", "Meal plans", "chef", "Plan status changed by MYUKCHEF", ["status"], "A meal plan was updated",
         "MYUKCHEF changed a plan's status to: {{status}}. Check your cook sheet."),
     t("plan.week_skipped_chef", "Meal plans", "chef", "Customer skipped a week", ["week", "date"], "A delivery was skipped",
@@ -208,6 +208,28 @@ export const TEMPLATES: TemplateDef[] = [
     t("admin.support_email", "Team alerts", "admin", "Support message email", ["name", "email", "phone", "message"], "Support request from {{name}}",
         "Name: {{name}}\nEmail: {{email}}\nPhone: {{phone}}\n\n{{message}}", { channels: EMAIL_ONLY, unavailable: ["inApp", "push", "sms"] }),
     t("admin.error", "Team alerts", "admin", "Error alert", ["source", "message", "where"], "Something went wrong", "{{message}} ({{where}})"),
+    t("admin.error_spike", "Team alerts", "admin", "Many errors at once", ["count", "minutes"], "Lots of errors right now",
+        "{{count}} errors in the last {{minutes}} minutes. Open System health to see what's failing.", { channels: ALL }),
+    t("admin.post_to_review", "Team alerts", "admin", "Chef video to check", ["chefName", "title"], "New chef video to check",
+        "{{chefName}} shared \"{{title}}\". Check it's about food.", { channels: { inApp: true, push: true, email: false, sms: false } }),
+
+    // ===== Chef videos =====
+    t("post.new_video", "Chef videos", "customer", "New video from a chef you follow", ["chefName", "title"], "{{chefName}} shared a new video", "{{title}}",
+        { channels: { inApp: true, push: true, email: false, sms: false } }),
+    t("chef.post_comment", "Chef videos", "chef", "New comment on your video", ["name", "title", "preview"], "{{name}} commented on your video", "{{preview}}",
+        { channels: { inApp: true, push: true, email: false, sms: false } }),
+    t("chef.post_removed", "Chef videos", "chef", "Video removed", ["title", "reason"], "Your video was removed",
+        "\"{{title}}\" was taken down: {{reason}}. Videos must be about your food and cooking. You can share another one now."),
+
+    // ===== Weekly reports =====
+    t("report.weekly_admin", "Weekly reports", "admin", "Weekly report for Super Admins", ["weekLabel", "orders", "revenue", "newCustomers", "errors"],
+        "MYUKCHEF weekly report: {{weekLabel}}",
+        "Here's how last week went.\n\n{{orders}} orders brought in £{{revenue}}, and {{newCustomers}} new customers joined. The server logged {{errors}} errors.\n\nThe full figures are below.",
+        { channels: EMAIL_ONLY, unavailable: ["inApp", "push", "sms"] }),
+    t("report.weekly_chef", "Weekly reports", "chef", "Weekly report for chefs", ["firstName", "weekLabel", "orders", "earnings", "rating", "newFollowers"],
+        "Your MYUKCHEF week: {{weekLabel}}",
+        "Hi {{firstName}},\n\nLast week you cooked {{orders}} orders and earned £{{earnings}}. Your rating is {{rating}}, and {{newFollowers}} new people followed you.\n\nThe full figures are below.",
+        { channels: EMAIL_ONLY, unavailable: ["inApp", "push", "sms"] }),
 ];
 
 export const TEMPLATE_MAP = new Map(TEMPLATES.map((d) => [d.key, d]));

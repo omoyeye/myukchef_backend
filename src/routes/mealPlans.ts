@@ -1,13 +1,14 @@
 import { Request, Router } from "express";
 import { withTemplate } from "../lib/templates";
-import { and, asc, desc, eq, gte, inArray, lte, ne } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, lte, ne, notInArray } from "drizzle-orm";
 import { db } from "../db";
 import { chefReviews, chefs, mealPlanMessages, mealPlans, mealPlanWeeks, users } from "../db/schema";
 import { getUserId, isAdmin, requireAdmin, requireAuth } from "../lib/auth";
 import { refreshBookingPayment, startWeekCheckout } from "../lib/bookingPayments";
 import { geocode, milesBetween, publicArea } from "../lib/geo";
 import {
-    addDays, addPoints, ALLERGENS, completeIfFinished, DELIVERY_WINDOWS, DIETARY, DURATIONS, eligibleDishes, getPlanConfig, isLocked,
+    addDays, addPoints, ALLERGENS, completeIfFinished, DELIVERY_WINDOWS, DIETARY, DURATIONS, discountFor, eligibleDishes, getPlanConfig, isLocked,
+    MAX_WEEKS, MIN_WEEKS, monthsFor, planLength, planWeeks, PRESET_WEEKS,
     isValidDate, lockTime, MEAL_OPTIONS, menuFromSelection, notify, notifyChef, priceWeek, resumePlan, SERVING_OPTIONS, strings, today, weekFromRotation,
 } from "../lib/mealPlans";
 import { assertNoContactDetails, redactContactDetails } from "../lib/contactGuard";
@@ -66,10 +67,13 @@ async function assertChangeable(plan: Plan, week: Week, statuses = ["scheduled"]
 /** A chef gets the delivery address after accepting. Phone numbers stay between the customer and MYUKCHEF. */
 function planForViewer(plan: Plan, role: Role) {
     const { adminNotes, ...rest } = plan;
-    if (role !== "chef") return { ...rest, ...(role === "admin" ? { adminNotes } : {}) };
+    // Plans from before flexible lengths may not have their weeks filled in yet.
+    const durationWeeks = planWeeks(plan);
+    if (role !== "chef") return { ...rest, durationWeeks, ...(role === "admin" ? { adminNotes } : {}) };
     const address = plan.deliveryAddress;
     return {
         ...rest,
+        durationWeeks,
         requests: redactContactDetails(plan.requests),
         deliveryAddress: AFTER_ACCEPTANCE.includes(plan.status)
             ? { street: address.street, city: address.city, postcode: address.postcode, phone: "" }
@@ -80,7 +84,19 @@ function planForViewer(plan: Plan, role: Role) {
 const summarise = (weeks: Week[]) => {
     const live = weeks.filter(countsTowardsCost);
     const date = today();
+    const delivered = weeks.filter((w) => w.status === "delivered");
+    // The dishes this household had most, for history and "order it again".
+    const eaten = new Map<string, { name: string; image: string; meals: number }>();
+    for (const w of delivered) for (const d of w.items ?? []) {
+        const e = eaten.get(d.dishId) ?? { name: d.name, image: d.image, meals: 0 };
+        e.meals += d.meals;
+        eaten.set(d.dishId, e);
+    }
     return {
+        mealsDelivered: delivered.reduce((sum, w) => sum + (w.items ?? []).reduce((s, d) => s + d.meals, 0), 0),
+        paidTotal: Math.round(weeks.filter((w) => w.isPaid).reduce((sum, w) => sum + w.total, 0) * 100) / 100,
+        favouriteDishes: [...eaten.values()].sort((a, b) => b.meals - a.meals).slice(0, 3),
+        lastDelivery: delivered.at(-1)?.deliveryDate ?? null,
         weeksTotal: weeks.length,
         weeksDelivered: weeks.filter((w) => w.status === "delivered").length,
         weeksSkipped: weeks.filter((w) => w.status === "skipped").length,
@@ -98,10 +114,13 @@ async function withSummaries<T extends Plan>(plans: T[]) {
 /** Validates a request and creates the plan with all of its weeks. Shared by "new plan" and "renew". */
 async function createPlan(userId: number, input: Record<string, any>, renewedFrom?: Plan) {
     const config = await getPlanConfig();
-    const durationMonths = Number(input.durationMonths);
+    // Any number of weeks from 1 to 26. Older app versions send 1, 3 or 6 months instead.
+    const weekCount = input.durationWeeks !== undefined ? Number(input.durationWeeks) : DURATIONS[Number(input.durationMonths)] ?? NaN;
     const mealsPerWeek = Number(input.mealsPerWeek);
     const servings = Number(input.servings);
-    if (!DURATIONS[durationMonths]) throw badRequest("Please choose a 1, 3 or 6 month plan");
+    if (!Number.isInteger(weekCount) || weekCount < MIN_WEEKS || weekCount > MAX_WEEKS) throw badRequest("Please choose a plan from 1 week to 6 months (26 weeks)");
+    const durationMonths = monthsFor(weekCount);
+    const length = planLength(weekCount, true);
     if (!MEAL_OPTIONS.includes(mealsPerWeek)) throw badRequest("Please choose how many meals you'd like each week");
     if (!SERVING_OPTIONS.includes(servings)) throw badRequest("Please choose how many people you're feeding");
     const deliveryWindow = DELIVERY_WINDOWS.includes(input.deliveryWindow) ? input.deliveryWindow : "afternoon";
@@ -148,11 +167,10 @@ async function createPlan(userId: number, input: Record<string, any>, renewedFro
     const rotation = chosenIds.map((id) => available.find((d) => d.id === id)).filter((d): d is NonNullable<typeof d> => !!d);
     if (rotation.length === 0 || rotation.length !== chosenIds.length) throw badRequest("Please choose dishes that suit your dietary needs and are available from this chef");
 
-    const discountPercent = config.discounts[durationMonths];
-    const weekCount = DURATIONS[durationMonths];
+    const discountPercent = discountFor(weekCount, config.discounts);
     const planId = await db.transaction(async (tx) => {
         const [{ id }] = await tx.insert(mealPlans).values({
-            userId, chefId: chef.id, durationMonths, mealsPerWeek, servings, deliveryWindow,
+            userId, chefId: chef.id, durationMonths, durationWeeks: weekCount, mealsPerWeek, servings, deliveryWindow,
             startDate: input.startDate,
             endDate: addDays(input.startDate, (weekCount - 1) * 7),
             discountPercent, deliveryFee: config.deliveryFee, dietary, avoidAllergens,
@@ -169,8 +187,8 @@ async function createPlan(userId: number, input: Record<string, any>, renewedFro
         return id;
     });
 
-    await withTemplate("plan.request_chef", { months: durationMonths, mealsPerWeek, servings, startDate: input.startDate }, () => notifyChef(chef.id, "New meal plan request", `A customer would like a ${durationMonths} month plan: ${mealsPerWeek} meals a week for ${servings}. Please reply before ${input.startDate}.`));
-    await withTemplate("plan.request_sent", { chefName: chef.displayName, months: durationMonths }, () => notify(userId, "We've sent your request", `${chef.displayName} will confirm your ${durationMonths} month plan. Nothing is charged yet.`, `/my-plans/${planId}`));
+    await withTemplate("plan.request_chef", { length, weeks: weekCount, months: durationMonths, mealsPerWeek, servings, startDate: input.startDate }, () => notifyChef(chef.id, "New meal plan request", `A customer would like a ${length} plan: ${mealsPerWeek} meals a week for ${servings}. Please reply before ${input.startDate}.`));
+    await withTemplate("plan.request_sent", { chefName: chef.displayName, length, weeks: weekCount, months: durationMonths }, () => notify(userId, "We've sent your request", `${chef.displayName} will confirm your ${length} plan. Nothing is charged yet.`, `/my-plans/${planId}`));
     const [plan] = await db.select().from(mealPlans).where(eq(mealPlans.id, planId)).limit(1);
     return plan;
 }
@@ -181,7 +199,13 @@ async function createPlan(userId: number, input: Record<string, any>, renewedFro
 router.get("/config", async (_req, res) => {
     const config = await getPlanConfig();
     res.json({
+        // Older app versions show these three.
         durations: [1, 3, 6].map((months) => ({ months, weeks: DURATIONS[months], discountPercent: config.discounts[months] })),
+        minWeeks: MIN_WEEKS,
+        maxWeeks: MAX_WEEKS,
+        presets: PRESET_WEEKS.map((weeks) => ({ weeks, label: planLength(weeks), discountPercent: discountFor(weeks, config.discounts) })),
+        // Savings start at these lengths.
+        discountTiers: [4, 13, 26].map((fromWeeks) => ({ fromWeeks, label: planLength(fromWeeks), discountPercent: discountFor(fromWeeks, config.discounts) })),
         cutoffHours: config.cutoffHours,
         leadDays: config.leadDays,
         deliveryFee: config.deliveryFee,
@@ -298,6 +322,103 @@ router.get("/mine", requireAuth, async (req, res) => {
         .orderBy(desc(mealPlans.createdAt));
     const summaries = await withSummaries(rows.map((r) => r.plan));
     res.json(rows.map((r) => ({ ...planForViewer(r.plan, "customer"), chef: r.chef, ...summaries.get(r.plan.id) })));
+});
+
+// === History and ordering again ===
+
+const FINISHED = ["completed", "cancelled", "declined", "expired"];
+const STARTED = ["completed", "cancelled", "active", "paused"];
+
+/** Whether the customer can order this plan again in one tap, and if not, why. */
+async function reorderState(plan: Plan, chef: { status: string; acceptsMealPlans: boolean } | undefined) {
+    if (!STARTED.includes(plan.status)) return { canReorder: false, reason: "This plan never started. Build a new one instead." };
+    if (!chef || chef.status !== "approved") return { canReorder: false, reason: "This chef isn't on MYUKCHEF any more." };
+    if (!chef.acceptsMealPlans) return { canReorder: false, reason: "This chef isn't taking new meal plans right now." };
+    const [next] = await db.select({ id: mealPlans.id, status: mealPlans.status }).from(mealPlans)
+        .where(and(eq(mealPlans.renewedFromId, plan.id), notInArray(mealPlans.status, ["declined", "expired"]))).limit(1);
+    if (next) return { canReorder: false, reason: "You've already ordered this plan again.", nextPlanId: next.id };
+    const [open] = await db.select({ id: mealPlans.id }).from(mealPlans)
+        .where(and(eq(mealPlans.userId, plan.userId), eq(mealPlans.chefId, plan.chefId), inArray(mealPlans.status, OPEN), ne(mealPlans.id, plan.id))).limit(1);
+    if (open) return { canReorder: false, reason: "You already have an open plan with this chef.", nextPlanId: open.id };
+    return { canReorder: true };
+}
+
+const chefCard = { id: chefs.id, displayName: chefs.displayName, avatar: chefs.avatar, specialty: chefs.specialty, status: chefs.status, acceptsMealPlans: chefs.acceptsMealPlans };
+
+// GET /meal-plans/history: the customer's finished plans, newest first
+router.get("/history", requireAuth, async (req, res) => {
+    const rows = await db.select({ plan: mealPlans, chef: chefCard }).from(mealPlans).innerJoin(chefs, eq(mealPlans.chefId, chefs.id))
+        .where(and(eq(mealPlans.userId, getUserId(req)), inArray(mealPlans.status, FINISHED))).orderBy(desc(mealPlans.endDate)).limit(100);
+    const summaries = await withSummaries(rows.map((r) => r.plan));
+    const list = [];
+    for (const r of rows) {
+        const { status, acceptsMealPlans, ...chef } = r.chef;
+        list.push({ ...planForViewer(r.plan, "customer"), chef, ...summaries.get(r.plan.id), ...(await reorderState(r.plan, { status, acceptsMealPlans })) });
+    }
+    const totals = list.reduce((t, p) => ({ plans: t.plans + 1, meals: t.meals + (p.mealsDelivered ?? 0), paid: Math.round((t.paid + (p.paidTotal ?? 0)) * 100) / 100 }), { plans: 0, meals: 0, paid: 0 });
+    res.json({ plans: list, totals });
+});
+
+// GET /meal-plans/suggestions: plans worth ordering again, shown to the customer
+router.get("/suggestions", requireAuth, async (req, res) => {
+    const soon = addDays(today(), 14);
+    const rows = await db.select({ plan: mealPlans, chef: chefCard }).from(mealPlans).innerJoin(chefs, eq(mealPlans.chefId, chefs.id))
+        .where(and(eq(mealPlans.userId, getUserId(req)), inArray(mealPlans.status, STARTED))).orderBy(desc(mealPlans.endDate)).limit(30);
+    const summaries = await withSummaries(rows.map((r) => r.plan));
+    const seenChefs = new Set<number>();
+    const suggestions = [];
+    for (const r of rows) {
+        // One suggestion per chef: their most recent plan. Running plans only once they're nearly over.
+        if (seenChefs.has(r.plan.chefId)) continue;
+        seenChefs.add(r.plan.chefId);
+        if (["active", "paused"].includes(r.plan.status) && r.plan.endDate > soon) continue;
+        const state = await reorderState(r.plan, r.chef);
+        if (!state.canReorder) continue;
+        const summary = summaries.get(r.plan.id)!;
+        if (r.plan.status === "cancelled" && summary.weeksDelivered === 0) continue;
+        const { status, acceptsMealPlans, ...chef } = r.chef;
+        const weeks = planWeeks(r.plan);
+        suggestions.push({
+            planId: r.plan.id,
+            chef,
+            reason: ["active", "paused"].includes(r.plan.status) ? `Your plan with ${chef.displayName} ends on ${r.plan.endDate}.` : `You had ${summary.mealsDelivered} meals from ${chef.displayName}.`,
+            durationWeeks: weeks,
+            length: planLength(weeks),
+            mealsPerWeek: r.plan.mealsPerWeek,
+            servings: r.plan.servings,
+            favouriteDishes: summary.favouriteDishes,
+            // About what a week costs, from the most recent week.
+            weeklyPrice: summary.weeksTotal ? Math.round((summary.estimatedTotal / Math.max(1, summary.weeksTotal - summary.weeksSkipped)) * 100) / 100 : null,
+            endedOn: r.plan.endDate,
+        });
+        if (suggestions.length >= 3) break;
+    }
+    res.json(suggestions);
+});
+
+// GET /meal-plans/chef/history: a chef's finished plans and what they cooked
+router.get("/chef/history", requireAuth, async (req, res) => {
+    const chef = await chefForUser(getUserId(req));
+    if (!chef) throw forbidden("Chef account required");
+    const rows = await db.select({ plan: mealPlans, customerName: users.name }).from(mealPlans).innerJoin(users, eq(mealPlans.userId, users.id))
+        .where(and(eq(mealPlans.chefId, chef.id), inArray(mealPlans.status, FINISHED))).orderBy(desc(mealPlans.endDate)).limit(200);
+    const summaries = await withSummaries(rows.map((r) => r.plan));
+    const plans = rows.map((r) => ({ ...planForViewer(r.plan, "chef"), customerName: r.customerName.split(" ")[0], ...summaries.get(r.plan.id), renewed: false }));
+    // Which ones the customer came back for.
+    const renewedIds = new Set((await db.select({ from: mealPlans.renewedFromId }).from(mealPlans)
+        .where(and(eq(mealPlans.chefId, chef.id), notInArray(mealPlans.status, ["declined", "expired"])))).map((r) => r.from));
+    for (const p of plans) p.renewed = renewedIds.has(p.id);
+    const started = plans.filter((p) => (p.weeksDelivered ?? 0) > 0);
+    res.json({
+        plans,
+        totals: {
+            plans: started.length,
+            meals: plans.reduce((s, p) => s + (p.mealsDelivered ?? 0), 0),
+            paid: Math.round(plans.reduce((s, p) => s + (p.paidTotal ?? 0), 0) * 100) / 100,
+            // How many customers came back for another plan.
+            returnRate: started.length ? Math.round((started.filter((p) => p.renewed).length / started.length) * 100) : 0,
+        },
+    });
 });
 
 // GET /meal-plans/:id
@@ -451,7 +572,7 @@ router.post("/:id/cancel", requireAuth, async (req, res) => {
     res.json({ status: "cancelled", stillComing: locked.map((w) => w.deliveryDate) });
 });
 
-// POST /meal-plans/:id/renew { durationMonths, startDate? }: plans only ever renew when the customer asks
+// POST /meal-plans/:id/renew { durationWeeks (1-26) or durationMonths, startDate? }: plans only ever renew when the customer asks
 router.post("/:id/renew", requireAuth, rateLimit(10, 60_000), async (req, res) => {
     const { plan, role } = await loadPlan(req);
     if (role !== "customer") throw forbidden("Only the customer can renew this plan");
@@ -465,7 +586,7 @@ router.post("/:id/renew", requireAuth, rateLimit(10, 60_000), async (req, res) =
     while (startDate < addDays(today(), leadDays)) startDate = addDays(startDate, 7);
     const renewed = await createPlan(plan.userId, {
         chefId: plan.chefId,
-        durationMonths: req.body.durationMonths ?? plan.durationMonths,
+        durationWeeks: req.body.durationWeeks ?? (req.body.durationMonths ? DURATIONS[Number(req.body.durationMonths)] : planWeeks(plan)),
         mealsPerWeek: plan.mealsPerWeek,
         servings: plan.servings,
         deliveryWindow: plan.deliveryWindow,

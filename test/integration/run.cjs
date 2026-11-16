@@ -28,6 +28,7 @@ const env = {
     AUTH_SECRET: "integration-test-secret-not-for-production-0123456789",
     BREVO_API_KEY: "",
     STRIPE_SECRET_KEY: "",
+    YOUTUBE_STUB: "1",
     UPLOAD_DIR: path.join(work, "uploads"),
     PRIVATE_UPLOAD_DIR: path.join(work, "private"),
     LOG_DIR: path.join(work, "logs"),
@@ -68,9 +69,14 @@ const env = {
     let failed = 0;
     for (const file of files) {
         process.stdout.write(`\n▶ ${file}\n`);
-        try {
-            execSync(`node ${JSON.stringify(path.join(__dirname, file))}`, { cwd: root, env, stdio: "inherit" });
-        } catch {
+        // Run asynchronously: a blocking call would stop us reading the server's output, and on Linux the
+        // server then freezes as soon as the pipe fills up (its console writes to a pipe are synchronous).
+        const code = await new Promise((resolve) => {
+            const child = spawn(process.execPath, [path.join(__dirname, file)], { cwd: root, env, stdio: "inherit" });
+            child.on("exit", (c) => resolve(c ?? 1));
+            child.on("error", () => resolve(1));
+        });
+        if (code !== 0) {
             failed++;
             const NL = String.fromCharCode(10);
             console.log(`${NL}--- last server output ---${NL}${serverLog.split(NL).slice(-60).join(NL)}${NL}--- end ---`);

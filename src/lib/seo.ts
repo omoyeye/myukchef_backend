@@ -5,7 +5,7 @@ import { chefProducts, chefs, products } from "../db/schema";
 export const SITE_URL = (process.env.SITE_URL || "https://myukchef.com").replace(/\/$/, "");
 const BRAND = "MYUKCHEF";
 
-const STATIC_PAGES = ["/", "/menu", "/chefs", "/meal-plans", "/events", "/recommend", "/support", "/allergens", "/privacy", "/terms", "/chef/register"];
+const STATIC_PAGES = ["/", "/menu", "/chefs", "/meal-plans", "/events", "/videos", "/app", "/recommend", "/support", "/allergens", "/privacy", "/terms", "/chef/register"];
 
 const escapeHtml = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 

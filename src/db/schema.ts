@@ -498,7 +498,10 @@ export const mealPlans = mysqlTable("meal_plans", {
     id: int("id").autoincrement().primaryKey(),
     userId: int("user_id").references(() => users.id).notNull(),
     chefId: int("chef_id").references(() => chefs.id).notNull(),
-    durationMonths: int("duration_months").notNull(), // 1 | 3 | 6
+    // Plans run for any number of weeks from 1 to 26 (six months). durationMonths is the length rounded
+    // to whole months, kept for older app versions; durationWeeks is the real length.
+    durationMonths: int("duration_months").notNull(),
+    durationWeeks: int("duration_weeks"),
     mealsPerWeek: int("meals_per_week").notNull(),
     servings: int("servings").notNull(),
     deliveryWindow: varchar("delivery_window", { length: 20 }).default("afternoon").notNull(),
@@ -636,3 +639,65 @@ export const chefCompliance = mysqlTable("chef_compliance", {
     verifiedAt: timestamp("verified_at"),
     updatedAt: timestamp("updated_at").defaultNow().notNull(),
 });
+
+// === CHEF VIDEOS ===
+// Chefs share one short YouTube video a week (up to a minute). Only the link is kept, never the video,
+// so nothing is stored on our server. Super Admins check each one is about food and can take it down.
+export const chefPosts = mysqlTable("chef_posts", {
+    id: int("id").autoincrement().primaryKey(),
+    chefId: int("chef_id").references(() => chefs.id, { onDelete: "cascade" }).notNull(),
+    youtubeId: varchar("youtube_id", { length: 20 }).notNull(),
+    title: varchar("title", { length: 150 }).notNull(),
+    caption: varchar("caption", { length: 500 }),
+    durationSeconds: int("duration_seconds"),
+    status: varchar("status", { length: 20 }).default("live").notNull(), // live | removed
+    review: varchar("review", { length: 20 }).default("unchecked").notNull(), // unchecked | food
+    removedReason: varchar("removed_reason", { length: 300 }),
+    reviewedBy: int("reviewed_by").references(() => users.id, { onDelete: "set null" }),
+    reviewedAt: timestamp("reviewed_at"),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+}, (t) => ({ byChef: index("chef_posts_chef_idx").on(t.chefId, t.createdAt), byReview: index("chef_posts_review_idx").on(t.status, t.review) }));
+
+// A plain id key: drizzle-kit can't compare two-column primary keys in MySQL and would try to rebuild
+// them on every push. The unique pair stops anyone following the same chef twice.
+export const chefFollows = mysqlTable("chef_follows", {
+    id: int("id").autoincrement().primaryKey(),
+    userId: int("user_id").references(() => users.id, { onDelete: "cascade" }).notNull(),
+    chefId: int("chef_id").references(() => chefs.id, { onDelete: "cascade" }).notNull(),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+}, (t) => ({ pair: unique("chef_follows_pair").on(t.userId, t.chefId), byChef: index("chef_follows_chef_idx").on(t.chefId, t.createdAt) }));
+
+export const postComments = mysqlTable("post_comments", {
+    id: int("id").autoincrement().primaryKey(),
+    postId: int("post_id").references(() => chefPosts.id, { onDelete: "cascade" }).notNull(),
+    userId: int("user_id").references(() => users.id, { onDelete: "cascade" }).notNull(),
+    body: varchar("body", { length: 500 }).notNull(),
+    status: varchar("status", { length: 20 }).default("visible").notNull(), // visible | removed
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+}, (t) => ({ byPost: index("post_comments_post_idx").on(t.postId, t.createdAt) }));
+
+// === BANNER ADVERTS ===
+// Super Admins create banners and choose where each one shows: on the website, in the app, or both,
+// on which page, for whom and between which dates.
+export const banners = mysqlTable("banners", {
+    id: int("id").autoincrement().primaryKey(),
+    title: varchar("title", { length: 120 }).notNull(),
+    message: varchar("message", { length: 300 }),
+    image: varchar("image", { length: 255 }),
+    ctaLabel: varchar("cta_label", { length: 40 }),
+    link: varchar("link", { length: 500 }),
+    placement: varchar("placement", { length: 20 }).default("home").notNull(), // home | menu | meal_plans | everywhere
+    audience: varchar("audience", { length: 20 }).default("everyone").notNull(), // everyone | customers | chefs | signed_out
+    theme: varchar("theme", { length: 20 }).default("brand").notNull(), // brand | dark | light
+    showOnWebsite: boolean("show_on_website").default(true).notNull(),
+    showOnApp: boolean("show_on_app").default(true).notNull(),
+    active: boolean("active").default(true).notNull(),
+    startsAt: timestamp("starts_at"),
+    endsAt: timestamp("ends_at"),
+    sortOrder: int("sort_order").default(0).notNull(),
+    views: int("views").default(0).notNull(),
+    clicks: int("clicks").default(0).notNull(),
+    createdBy: int("created_by").references(() => users.id, { onDelete: "set null" }),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+    updatedAt: timestamp("updated_at").defaultNow().notNull(),
+}, (t) => ({ live: index("banners_live_idx").on(t.active, t.placement) }));

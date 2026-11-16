@@ -3,6 +3,9 @@ import { and, eq, gte, inArray, lte, notInArray, sql } from "drizzle-orm";
 import { db } from "../db";
 import { chefInvoices, chefProducts, chefs, orderChefProgress, orderItems, orders, products, users } from "../db/schema";
 import { getUserId, requireAdmin, requireAuth } from "../lib/auth";
+import { adminWeeklyReport, chefWeeklyReport, sendAdminReport, sendChefReport } from "../lib/weeklyReports";
+import { getBrevo } from "../lib/integrations";
+import { rateLimit } from "../lib/rateLimit";
 
 /** Sales reports for the Super Admin, and each chef's own earnings. */
 const router = Router();
@@ -164,6 +167,51 @@ router.get("/chef", requireAuth, async (req, res, next) => {
             byDay: [...byDay.values()].map((d) => ({ ...d, sales: round(d.sales), earned: round(d.earned) })),
             bestSellers: sold.map((s) => ({ name: s.name, quantity: Number(s.quantity), sales: round(Number(s.sales)) })).sort((a, b) => b.quantity - a.quantity).slice(0, 8),
         });
+    } catch (error) { next(error); }
+});
+
+// === Weekly reports (emailed every Monday morning) ===
+const weeksAgo = (v: unknown) => Math.min(52, Math.max(0, Number(v ?? 1) || 0));
+const emailLimit = rateLimit(5, 60_000);
+const meOf = async (req: Parameters<typeof getUserId>[0]) => (await db.select({ email: users.email, name: users.name }).from(users).where(eq(users.id, getUserId(req))).limit(1))[0];
+const chefOf = async (req: Parameters<typeof getUserId>[0]) => (await db.select({ id: chefs.id }).from(chefs).where(eq(chefs.userId, getUserId(req))).limit(1))[0];
+const needsEmail = async () => !(await getBrevo()).apiKey;
+
+// GET /reports/weekly/admin?weeksAgo=1
+router.get("/weekly/admin", requireAdmin, async (req, res, next) => {
+    try { res.json(await adminWeeklyReport(weeksAgo(req.query.weeksAgo))); } catch (error) { next(error); }
+});
+// POST /reports/weekly/admin/email: sends the report to the signed-in Super Admin now
+router.post("/weekly/admin/email", requireAdmin, emailLimit, async (req, res, next) => {
+    try {
+        if (await needsEmail()) return res.status(400).json({ error: "Email isn't set up yet. Add your Brevo key under Payments and email." });
+        const me = await meOf(req);
+        await sendAdminReport([me!.email], weeksAgo(req.body?.weeksAgo));
+        res.json({ sentTo: me!.email });
+    } catch (error) { next(error); }
+});
+// GET /reports/weekly/chef?weeksAgo=1
+router.get("/weekly/chef", requireAuth, async (req, res, next) => {
+    try {
+        const chef = await chefOf(req);
+        if (!chef) return res.status(403).json({ error: "Chef account required" });
+        res.json(await chefWeeklyReport(chef.id, weeksAgo(req.query.weeksAgo)));
+    } catch (error) { next(error); }
+});
+// POST /reports/weekly/chef/email: emails the chef their report now
+router.post("/weekly/chef/email", requireAuth, emailLimit, async (req, res, next) => {
+    try {
+        const chef = await chefOf(req);
+        if (!chef) return res.status(403).json({ error: "Chef account required" });
+        if (await needsEmail()) return res.status(400).json({ error: "Email isn't available right now. Please try later." });
+        const me = await meOf(req);
+        try {
+            await sendChefReport(chef.id, me!.email, me!.name, weeksAgo(req.body?.weeksAgo));
+        } catch (error) {
+            console.error("Chef report email failed:", (error as Error).message);
+            return res.status(502).json({ error: "We couldn't send the email just now. Please try again later." });
+        }
+        res.json({ sentTo: me!.email });
     } catch (error) { next(error); }
 });
 
