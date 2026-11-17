@@ -18,6 +18,7 @@ import { assertNoContactDetails } from "../lib/contactGuard";
 import { rateLimit } from "../lib/rateLimit";
 import { cleanAllergens } from "../lib/allergens";
 import { notify, notifyAdmins, notifyChef } from "../lib/notify";
+import { areaFor, areaSettings } from "../lib/serviceArea";
 import { blurCoordinate, geocode, milesBetween, parseCoordinates, publicArea } from "../lib/geo";
 
 const router = Router();
@@ -209,14 +210,15 @@ router.get("/", async (req, res) => {
         if (!origin) return res.json(pageOf(all.map((chef) => ({ ...publicChef(chef), ...stats.get(chef.id), ...badges(chef.id) })), req.query));
 
         const withDistance = all.map((chef) => {
-            const distanceMiles = chef.latitude !== null && chef.longitude !== null
-                ? Math.round(milesBetween(origin, { lat: chef.latitude, lng: chef.longitude }) * 10) / 10
-                : null;
-            return { ...publicChef(chef), ...stats.get(chef.id), ...badges(chef.id), distanceMiles, inServiceArea: distanceMiles !== null && distanceMiles <= chef.serviceRadiusMiles };
+            const area = areaFor(chef, origin);
+            // areaStatus: inside, far (delivers with a longer wait), outside (doesn't deliver here) or unknown.
+            return { ...publicChef(chef), ...stats.get(chef.id), ...badges(chef.id), distanceMiles: area.miles, inServiceArea: area.status === "inside", areaStatus: area.status, extraWaitHours: area.extraHours };
         });
-        // Chefs who serve this area first, then by distance. Chefs with no known location go last.
+        // Chefs who serve this area first, then those who'll come further with a wait, then by distance.
+        // Chefs with no known location go last.
+        const rank = { inside: 0, far: 1, outside: 2, unknown: 3 } as const;
         withDistance.sort((a, b) =>
-            Number(b.inServiceArea) - Number(a.inServiceArea) ||
+            rank[a.areaStatus] - rank[b.areaStatus] ||
             (a.distanceMiles ?? Infinity) - (b.distanceMiles ?? Infinity));
         res.json(pageOf(withDistance, req.query));
     } catch (error) {
@@ -282,7 +284,7 @@ router.put("/me", async (req, res) => {
             phone: phone ?? chef.phone,
             location: location ?? chef.location,
             ...(await locationFields(location, chef)),
-            serviceRadiusMiles: serviceRadiusMiles !== undefined ? Number(serviceRadiusMiles) || chef.serviceRadiusMiles : chef.serviceRadiusMiles,
+            ...areaSettings(req.body),
             yearsExperience: yearsExperience !== undefined ? Number(yearsExperience) : chef.yearsExperience,
             isAvailableForEvents: isAvailableForEvents !== undefined ? !!isAvailableForEvents : chef.isAvailableForEvents,
             eventRate: eventRate !== undefined ? Number(eventRate) : chef.eventRate,
@@ -714,7 +716,7 @@ router.put("/admin/:id", requireAdmin, async (req, res, next) => {
             phone: b.phone ?? chef.phone,
             location: b.location ?? chef.location,
             ...(await locationFields(b.location, chef)),
-            serviceRadiusMiles: b.serviceRadiusMiles !== undefined ? Number(b.serviceRadiusMiles) || chef.serviceRadiusMiles : chef.serviceRadiusMiles,
+            ...areaSettings(b),
             yearsExperience: b.yearsExperience !== undefined ? Number(b.yearsExperience) || null : chef.yearsExperience,
             isAvailableForEvents: b.isAvailableForEvents !== undefined ? !!b.isAvailableForEvents : chef.isAvailableForEvents,
             eventRate: b.eventRate !== undefined ? Number(b.eventRate) || null : chef.eventRate,

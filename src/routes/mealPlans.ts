@@ -5,7 +5,12 @@ import { db } from "../db";
 import { chefReviews, chefs, mealPlanMessages, mealPlans, mealPlanWeeks, users } from "../db/schema";
 import { getUserId, isAdmin, requireAdmin, requireAuth } from "../lib/auth";
 import { refreshBookingPayment, startWeekCheckout } from "../lib/bookingPayments";
-import { geocode, milesBetween, publicArea } from "../lib/geo";
+import { geocode, publicArea } from "../lib/geo";
+import { MAX_PEOPLE, peopleLabel, readPeople } from "../lib/people";
+import { announceAccepted, nextDue, paymentDue } from "../lib/planPayments";
+import { markWeekPaid } from "../lib/bookingPayments";
+import { paymentConfig } from "../lib/payments";
+import { areaFor, farAwayEntry, farWaitNeeded, waitLabel } from "../lib/serviceArea";
 import {
     addDays, addPoints, ALLERGENS, completeIfFinished, DELIVERY_WINDOWS, DIETARY, DURATIONS, discountFor, eligibleDishes, getPlanConfig, isLocked,
     MAX_WEEKS, MIN_WEEKS, monthsFor, planLength, planWeeks, PRESET_WEEKS,
@@ -69,11 +74,14 @@ function planForViewer(plan: Plan, role: Role) {
     const { adminNotes, ...rest } = plan;
     // Plans from before flexible lengths may not have their weeks filled in yet.
     const durationWeeks = planWeeks(plan);
-    if (role !== "chef") return { ...rest, durationWeeks, ...(role === "admin" ? { adminNotes } : {}) };
+    // "2 adults and 1 child", so whoever reads the plan knows who the food is for.
+    const people = peopleLabel(plan, plan.servings);
+    if (role !== "chef") return { ...rest, durationWeeks, people, ...(role === "admin" ? { adminNotes } : {}) };
     const address = plan.deliveryAddress;
     return {
         ...rest,
         durationWeeks,
+        people,
         requests: redactContactDetails(plan.requests),
         deliveryAddress: AFTER_ACCEPTANCE.includes(plan.status)
             ? { street: address.street, city: address.city, postcode: address.postcode, phone: "" }
@@ -102,6 +110,8 @@ const summarise = (weeks: Week[]) => {
         weeksSkipped: weeks.filter((w) => w.status === "skipped").length,
         estimatedTotal: Math.round(live.reduce((sum, w) => sum + w.total, 0) * 100) / 100,
         nextDelivery: live.find((w) => w.status !== "delivered" && w.deliveryDate >= date) ?? null,
+        // The next delivery still to pay for, so plan lists can show a "Pay now" button.
+        nextPayment: (() => { const w = nextDue(weeks); return w ? { weekId: w.id, weekNumber: w.weekNumber, deliveryDate: w.deliveryDate, amount: w.total } : null; })(),
     };
 };
 
@@ -117,12 +127,13 @@ async function createPlan(userId: number, input: Record<string, any>, renewedFro
     // Any number of weeks from 1 to 26. Older app versions send 1, 3 or 6 months instead.
     const weekCount = input.durationWeeks !== undefined ? Number(input.durationWeeks) : DURATIONS[Number(input.durationMonths)] ?? NaN;
     const mealsPerWeek = Number(input.mealsPerWeek);
-    const servings = Number(input.servings);
+    // Adults and children, priced the same per portion. The chef sees the split.
+    const people = readPeople(input, "servings", MAX_PEOPLE.plan);
+    const servings = people.total;
     if (!Number.isInteger(weekCount) || weekCount < MIN_WEEKS || weekCount > MAX_WEEKS) throw badRequest("Please choose a plan from 1 week to 6 months (26 weeks)");
     const durationMonths = monthsFor(weekCount);
     const length = planLength(weekCount, true);
     if (!MEAL_OPTIONS.includes(mealsPerWeek)) throw badRequest("Please choose how many meals you'd like each week");
-    if (!SERVING_OPTIONS.includes(servings)) throw badRequest("Please choose how many people you're feeding");
     const deliveryWindow = DELIVERY_WINDOWS.includes(input.deliveryWindow) ? input.deliveryWindow : "afternoon";
 
     const [chef] = await db.select().from(chefs).where(and(eq(chefs.id, Number(input.chefId)), eq(chefs.status, "approved"))).limit(1);
@@ -149,12 +160,15 @@ async function createPlan(userId: number, input: Record<string, any>, renewedFro
     };
     if (!address.street || !address.city || !address.postcode || !address.phone) throw badRequest("Please add your full delivery address and a phone number");
 
-    // If either location can't be found, the chef decides when they review the request.
-    if (chef.latitude !== null && chef.longitude !== null) {
-        const point = await geocode(address.postcode).catch(() => null);
-        if (point && milesBetween(point, { lat: chef.latitude, lng: chef.longitude }) > chef.serviceRadiusMiles) {
-            throw badRequest(`${chef.displayName} doesn't deliver to ${address.postcode} yet. Try a chef closer to you.`);
-        }
+    // If either location can't be found, the chef decides when they review the request. Chefs who take
+    // far-away plans need the customer to agree to their extra wait, and start that much later.
+    const area = areaFor(chef, chef.latitude !== null ? await geocode(address.postcode).catch(() => null) : null);
+    if (area.status === "outside") throw badRequest(`${chef.displayName} doesn't deliver to ${address.postcode} (${area.miles} miles away). Try a chef closer to you.`);
+    const farAway = area.status === "far" ? [farAwayEntry(chef, area)] : null;
+    if (farAway && input.acceptFarWait !== true) throw farWaitNeeded(farAway);
+    if (farAway) {
+        const farEarliest = addDays(today(), config.leadDays + Math.ceil(area.extraHours / 24));
+        if (input.startDate < farEarliest) throw badRequest(`${chef.displayName} needs about ${waitLabel(area.extraHours)} more for deliveries to you. Please start on or after ${farEarliest}.`);
     }
 
     assertNoContactDetails(input.requests);
@@ -170,7 +184,8 @@ async function createPlan(userId: number, input: Record<string, any>, renewedFro
     const discountPercent = discountFor(weekCount, config.discounts);
     const planId = await db.transaction(async (tx) => {
         const [{ id }] = await tx.insert(mealPlans).values({
-            userId, chefId: chef.id, durationMonths, durationWeeks: weekCount, mealsPerWeek, servings, deliveryWindow,
+            userId, chefId: chef.id, durationMonths, durationWeeks: weekCount, mealsPerWeek, servings, adults: people.adults, kids: people.kids, deliveryWindow,
+            farAway, farWaitAcceptedAt: farAway ? new Date() : null,
             startDate: input.startDate,
             endDate: addDays(input.startDate, (weekCount - 1) * 7),
             discountPercent, deliveryFee: config.deliveryFee, dietary, avoidAllergens,
@@ -187,7 +202,9 @@ async function createPlan(userId: number, input: Record<string, any>, renewedFro
         return id;
     });
 
-    await withTemplate("plan.request_chef", { length, weeks: weekCount, months: durationMonths, mealsPerWeek, servings, startDate: input.startDate }, () => notifyChef(chef.id, "New meal plan request", `A customer would like a ${length} plan: ${mealsPerWeek} meals a week for ${servings}. Please reply before ${input.startDate}.`));
+    const who = peopleLabel(people, servings);
+    const farNote = farAway ? ` They're ${area.miles} miles away (outside your usual area) and agreed to wait ${waitLabel(area.extraHours)} longer.` : "";
+    await withTemplate("plan.request_chef", { length, weeks: weekCount, months: durationMonths, mealsPerWeek, servings, people: who, startDate: input.startDate }, () => notifyChef(chef.id, "New meal plan request", `A customer would like a ${length} plan: ${mealsPerWeek} meals a week for ${who}.${farNote} Please reply before ${input.startDate}.`));
     await withTemplate("plan.request_sent", { chefName: chef.displayName, length, weeks: weekCount, months: durationMonths }, () => notify(userId, "We've sent your request", `${chef.displayName} will confirm your ${length} plan. Nothing is charged yet.`, `/my-plans/${planId}`));
     const [plan] = await db.select().from(mealPlans).where(eq(mealPlans.id, planId)).limit(1);
     return plan;
@@ -211,6 +228,8 @@ router.get("/config", async (_req, res) => {
         deliveryFee: config.deliveryFee,
         mealOptions: MEAL_OPTIONS,
         servingOptions: SERVING_OPTIONS,
+        // Newer apps ask for adults and children, up to this many people in all.
+        maxPeople: MAX_PEOPLE.plan,
     });
 });
 
@@ -293,11 +312,18 @@ router.get("/chef/cook-sheet", requireAuth, async (req, res) => {
         ))
         .orderBy(asc(mealPlanWeeks.deliveryDate));
     const { cutoffHours } = await getPlanConfig();
+    const { cardPayments } = await paymentConfig();
     res.json(rows.map(({ week, plan, customerName }) => ({
         ...week,
         locked: isLocked(week.deliveryDate, cutoffHours),
+        // With card payments on, chefs cook a delivery once it's paid.
+        awaitingPayment: cardPayments && !week.isPaid && week.total >= 0.3,
         customerName,
         servings: plan.servings,
+        adults: plan.adults,
+        kids: plan.kids,
+        people: peopleLabel(plan, plan.servings),
+        farAway: plan.farAway,
         deliveryWindow: plan.deliveryWindow,
         deliveryAddress: { street: plan.deliveryAddress.street, city: plan.deliveryAddress.city, postcode: plan.deliveryAddress.postcode },
         dietary: plan.dietary,
@@ -386,6 +412,8 @@ router.get("/suggestions", requireAuth, async (req, res) => {
             length: planLength(weeks),
             mealsPerWeek: r.plan.mealsPerWeek,
             servings: r.plan.servings,
+            adults: r.plan.adults,
+            kids: r.plan.kids,
             favouriteDishes: summary.favouriteDishes,
             // About what a week costs, from the most recent week.
             weeklyPrice: summary.weeksTotal ? Math.round((summary.estimatedTotal / Math.max(1, summary.weeksTotal - summary.weeksSkipped)) * 100) / 100 : null,
@@ -442,6 +470,8 @@ router.get("/:id", requireAuth, async (req, res) => {
         leadDays,
         ...summarise(weeks),
         weeks: weeks.map((w) => ({ ...w, locked: isLocked(w.deliveryDate, cutoffHours), lockAt: lockTime(w.deliveryDate, cutoffHours).toISOString() })),
+        // The "pay now" card: the next delivery to pay for by card, and the time to pay by.
+        paymentDue: await paymentDue(plan, weeks, cutoffHours),
         messages,
         canReview: role === "customer" ? !!(await reviewSource(plan.userId, plan.chefId)) : false,
         myReview: review ?? null,
@@ -458,7 +488,8 @@ router.patch("/:id/respond", requireAuth, async (req, res) => {
     if (req.body.action === "accept") {
         if (plan.startDate < today()) throw badRequest("The start date has already passed");
         await db.update(mealPlans).set({ status: "active", chefNote: note }).where(eq(mealPlans.id, plan.id));
-        await withTemplate("plan.confirmed", { note: note ?? "" }, () => notify(plan.userId, "Your meal plan is confirmed", note || "Your chef has accepted your plan. You can now change, skip or pause any week before its cut-off.", `/my-plans/${plan.id}`));
+        // Email, push and in-app: "accepted, please pay for your first delivery" (or just "confirmed" without card payments).
+        await announceAccepted({ ...plan, status: "active", chefNote: note }, note);
     } else if (req.body.action === "decline") {
         await db.update(mealPlans).set({ status: "declined", chefNote: note }).where(eq(mealPlans.id, plan.id));
         await db.update(mealPlanWeeks).set({ status: "cancelled" }).where(eq(mealPlanWeeks.planId, plan.id));
@@ -589,6 +620,9 @@ router.post("/:id/renew", requireAuth, rateLimit(10, 60_000), async (req, res) =
         durationWeeks: req.body.durationWeeks ?? (req.body.durationMonths ? DURATIONS[Number(req.body.durationMonths)] : planWeeks(plan)),
         mealsPerWeek: plan.mealsPerWeek,
         servings: plan.servings,
+        adults: plan.adults ?? undefined,
+        kids: plan.adults === null ? undefined : plan.kids,
+        acceptFarWait: req.body.acceptFarWait,
         deliveryWindow: plan.deliveryWindow,
         startDate,
         dietary: plan.dietary,
@@ -642,7 +676,9 @@ router.post("/:id/weeks/:weekId/payment-status", requireAuth, async (req, res) =
 router.patch("/:id/weeks/:weekId/payment", requireAdmin, async (req, res) => {
     const { plan } = await loadPlan(req);
     const week = await loadWeek(plan, req.params.weekId);
-    await db.update(mealPlanWeeks).set({ isPaid: !!req.body.isPaid }).where(eq(mealPlanWeeks.id, week.id));
+    // Recording a payment tells the customer, Super Admins and the chef, just like a card payment.
+    if (req.body.isPaid && !week.isPaid) await markWeekPaid(week.id, null, "admin");
+    else await db.update(mealPlanWeeks).set({ isPaid: !!req.body.isPaid, ...(req.body.isPaid ? {} : { paidAt: null }) }).where(eq(mealPlanWeeks.id, week.id));
     res.json({ isPaid: !!req.body.isPaid });
 });
 

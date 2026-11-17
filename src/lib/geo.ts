@@ -58,6 +58,11 @@ async function fromPostcodesIo(query: string): Promise<GeoPoint | null> {
 export async function geocode(query: string | null | undefined): Promise<GeoPoint | null> {
     const q = query?.trim();
     if (!q) return null;
+    // Tests only: "TE30 1AA" is 30 miles due north of a fixed point, so no network is needed.
+    if (process.env.GEOCODE_STUB === "1") {
+        const miles = q.match(/^TE(\d+)\s/i)?.[1];
+        if (miles !== undefined) return { lat: 51.5 + Number(miles) / 69.05, lng: -0.1, label: q.toUpperCase() };
+    }
     try {
         const key = process.env.GOOGLE_MAPS_API_KEY;
         return key ? await fromGoogle(q, key) : await fromPostcodesIo(q);

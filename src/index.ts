@@ -157,9 +157,9 @@ app.get(/.*/, async (req, res, next) => {
     } catch (error) { next(error); }
 });
 
-app.use((error: Error & { status?: number; code?: string }, _req: Request, res: Response, _next: NextFunction) => {
+app.use((error: Error & { status?: number; code?: string; details?: Record<string, unknown> }, _req: Request, res: Response, _next: NextFunction) => {
     if (error.code === "ENOENT") return res.status(404).send("The frontend hasn't been built yet. Run npm run build.");
-    if (error.status && error.status < 500) return res.status(error.status).json({ error: error.message });
+    if (error.status && error.status < 500) return res.status(error.status).json({ error: error.message, ...(error.details ?? {}) });
     if (error.name === "MulterError") return res.status(400).json({ error: error.message });
     console.error("Unhandled error:", error);
     reportServerError(error, `${_req.method} ${_req.path}`);

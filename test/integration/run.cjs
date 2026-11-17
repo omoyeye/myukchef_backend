@@ -29,6 +29,7 @@ const env = {
     BREVO_API_KEY: "",
     STRIPE_SECRET_KEY: "",
     YOUTUBE_STUB: "1",
+    GEOCODE_STUB: "1",
     UPLOAD_DIR: path.join(work, "uploads"),
     PRIVATE_UPLOAD_DIR: path.join(work, "private"),
     LOG_DIR: path.join(work, "logs"),
@@ -65,7 +66,8 @@ const env = {
         await new Promise((r) => setTimeout(r, 1000));
     }
 
-    const files = fs.readdirSync(__dirname).filter((f) => f.endsWith(".test.cjs")).sort();
+    // TEST_ONLY=97 runs just the files whose names contain it.
+    const files = fs.readdirSync(__dirname).filter((f) => f.endsWith(".test.cjs") && (!process.env.TEST_ONLY || f.includes(process.env.TEST_ONLY))).sort();
     let failed = 0;
     for (const file of files) {
         process.stdout.write(`\n▶ ${file}\n`);

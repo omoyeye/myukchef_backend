@@ -47,6 +47,11 @@ export const chefs = mysqlTable("chefs", {
     latitude: double("latitude"),
     longitude: double("longitude"),
     serviceRadiusMiles: int("service_radius_miles").default(15).notNull(),
+    // Orders from beyond the usual area: allowed or not, the extra wait the customer agrees to, and
+    // how far the chef will go at most (0 means anywhere).
+    acceptsFarOrders: boolean("accepts_far_orders").default(false).notNull(),
+    farExtraHours: int("far_extra_hours").default(24).notNull(),
+    farMaxMiles: int("far_max_miles").default(0).notNull(),
     yearsExperience: int("years_experience"),
     status: text("status").default("pending").notNull(), // pending | approved | suspended | rejected
     rejectionReason: text("rejection_reason"),
@@ -101,6 +106,9 @@ export const events = mysqlTable("events", {
     eventDate: timestamp("event_date").notNull(),
     eventTime: text("event_time").notNull(),
     headcount: int("headcount").notNull(),
+    // Adults and children within the headcount. Null on bookings made before the split.
+    adults: int("adults"),
+    kids: int("kids").default(0).notNull(),
     venue: text("venue").notNull(),
     contactPhone: text("contact_phone").notNull(),
     contactEmail: text("contact_email").notNull(),
@@ -205,6 +213,9 @@ export const orders = mysqlTable("orders", {
     deliveryCodeWaived: varchar("delivery_code_waived", { length: 300 }),
     // Paid from the customer's MYUKCHEF wallet (already taken off the total).
     walletAmount: double("wallet_amount").default(0).notNull(),
+    // Chefs in this order who are outside their usual area, and when the customer agreed to the longer wait.
+    farAway: json("far_away").$type<{ chefId: number; name: string; miles: number; radiusMiles: number; extraHours: number }[]>(),
+    farWaitAcceptedAt: timestamp("far_wait_accepted_at"),
     // not_required (card payments not switched on) | awaiting | paid | refunded | failed
     paymentStatus: varchar("payment_status", { length: 20 }).default("not_required").notNull(),
     stripeSessionId: varchar("stripe_session_id", { length: 255 }),
@@ -514,6 +525,12 @@ export const mealPlans = mysqlTable("meal_plans", {
     durationWeeks: int("duration_weeks"),
     mealsPerWeek: int("meals_per_week").notNull(),
     servings: int("servings").notNull(),
+    // Adults and children within the servings. Null on plans made before the split.
+    adults: int("adults"),
+    kids: int("kids").default(0).notNull(),
+    // Set when the customer chose a chef outside that chef's usual area and agreed to the longer wait.
+    farAway: json("far_away").$type<{ chefId: number; name: string; miles: number; radiusMiles: number; extraHours: number }[]>(),
+    farWaitAcceptedAt: timestamp("far_wait_accepted_at"),
     deliveryWindow: varchar("delivery_window", { length: 20 }).default("afternoon").notNull(),
     startDate: date("start_date", { mode: "string" }).notNull(),
     endDate: date("end_date", { mode: "string" }).notNull(),
@@ -555,6 +572,10 @@ export const mealPlanWeeks = mysqlTable("meal_plan_weeks", {
     stripePaymentIntentId: varchar("stripe_payment_intent_id", { length: 255 }),
     paidAt: timestamp("paid_at"),
     lockReminderSent: boolean("lock_reminder_sent").default(false).notNull(),
+    // Card payments: the customer was reminded to pay before the cut-off, and (if still unpaid at the
+    // cut-off) the chef was told to wait and Super Admins were alerted.
+    paymentReminderSent: boolean("payment_reminder_sent").default(false).notNull(),
+    unpaidAlertSent: boolean("unpaid_alert_sent").default(false).notNull(),
 }, (t) => ({ planWeek: unique("plan_week_unique").on(t.planId, t.weekNumber) }));
 
 export const mealPlanMessages = mysqlTable("meal_plan_messages", {

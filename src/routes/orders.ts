@@ -11,20 +11,22 @@ import { availableSlots, MAX_DAYS_AHEAD, problemWith, type BasketChef } from "..
 import { chefTimes, sellingChefs } from "../lib/selling";
 import { listThreads, postMessage } from "../lib/orderMessages";
 
+type AreaBasketChef = BasketChef & { row: typeof chefs.$inferSelect };
+
 /** The chefs behind a basket, each with the longest notice any of their dishes needs. */
 async function basketChefs(itemIds: string[]) {
     const ids = [...new Set(itemIds.filter((id) => typeof id === "string"))].slice(0, 100);
-    if (!ids.length) return { basket: [] as BasketChef[], unavailable: [] as string[] };
+    if (!ids.length) return { basket: [] as AreaBasketChef[], unavailable: [] as string[] };
     const menu = await db.select({ id: products.id, chefId: products.chefId }).from(products).where(inArray(products.id, ids));
     const chefDishes = await db.select({ id: chefProducts.id, chefId: chefProducts.chefId, noticeHours: chefProducts.noticeHours }).from(chefProducts).where(inArray(chefProducts.id, ids));
     const lines = [...menu.map((m) => ({ ...m, noticeHours: null as number | null })), ...chefDishes].filter((l) => l.chefId !== null) as { id: string; chefId: number; noticeHours: number | null }[];
     const sellers = await sellingChefs([...new Set(lines.map((l) => l.chefId))]);
-    const byChef = new Map<number, BasketChef>();
+    const byChef = new Map<number, AreaBasketChef>();
     const unavailable: string[] = [];
     for (const line of lines) {
         const chef = sellers.get(line.chefId);
         if (!chef) { unavailable.push(line.id); continue; }
-        const current = byChef.get(chef.id) ?? { chef: chefTimes(chef), noticeHours: chef.noticeHours };
+        const current = byChef.get(chef.id) ?? { chef: chefTimes(chef), noticeHours: chef.noticeHours, row: chef };
         current.noticeHours = Math.max(current.noticeHours, line.noticeHours ?? 0);
         byChef.set(chef.id, current);
     }
@@ -35,6 +37,21 @@ import { geocode, milesBetween, parseCoordinates } from "../lib/geo";
 import { codeForNewOrder, waiveDeliveryCode } from "../lib/deliveryCode";
 import { linkSpendToOrder, returnEntry, returnForOrder, takeForOrder } from "../lib/wallet";
 import { badRequest, calculateTotals, getOrderSettings, validateDiscount } from "../lib/pricing";
+import { areaFor, farAwayEntry, farWaitNeeded, type FarAway } from "../lib/serviceArea";
+
+/**
+ * Checks every chef in a delivery basket delivers to this point. Chefs further out who take far-away
+ * orders add their extra wait to the notice they need. Returns those chefs; throws for chefs who don't deliver there.
+ */
+function applyArea(basket: Awaited<ReturnType<typeof basketChefs>>["basket"], point: { lat: number; lng: number } | null, where: string) {
+    const far: FarAway[] = [];
+    for (const b of basket) {
+        const area = areaFor(b.row, point);
+        if (area.status === "outside") throw badRequest(`${b.row.displayName} doesn't deliver to ${where || "your address"} (${area.miles} miles away). Choose collection, or a chef nearer to you.`);
+        if (area.status === "far") { far.push(farAwayEntry(b.row, area)); b.noticeHours += area.extraHours; }
+    }
+    return far;
+}
 
 const router = Router();
 const messageLimit = rateLimit(30, 60_000);
@@ -58,12 +75,24 @@ router.post("/:id/confirm-delivery", async (req, res, next) => {
     } catch (error) { next(error); }
 });
 
-// POST /orders/slots { itemIds }: the delivery times that suit every chef in the basket
+// POST /orders/slots { itemIds, postcode?, lat?, lng?, method? }: the delivery times that suit every chef
+// in the basket. With a delivery address, chefs outside their usual area add their extra wait, and are
+// listed so the customer can agree to it (or see who doesn't deliver there).
 router.post("/slots", async (req, res, next) => {
     try {
         const { basket } = await basketChefs(Array.isArray(req.body?.itemIds) ? req.body.itemIds : []);
+        const delivery = req.body?.method !== "pickup";
+        const postcode = typeof req.body?.postcode === "string" ? req.body.postcode.trim().slice(0, 12) : "";
+        const point = !delivery ? null : parseCoordinates(req.body?.lat, req.body?.lng) ?? (postcode.length >= 2 ? await geocode(postcode).catch(() => null) : null);
+        const farAway: FarAway[] = [];
+        const outside: { chefId: number; name: string; miles: number | null; radiusMiles: number }[] = [];
+        for (const b of basket) {
+            const area = areaFor(b.row, point);
+            if (area.status === "far") { farAway.push(farAwayEntry(b.row, area)); b.noticeHours += area.extraHours; }
+            if (area.status === "outside") outside.push({ chefId: b.row.id, name: b.row.displayName, miles: area.miles, radiusMiles: b.row.serviceRadiusMiles });
+        }
         const { slots, reason } = availableSlots(basket);
-        res.json({ slots, earliest: slots[0] ?? null, reason, noticeHours: Math.max(0, ...basket.map((b) => b.noticeHours)) });
+        res.json({ slots, earliest: slots[0] ?? null, reason, noticeHours: Math.max(0, ...basket.map((b) => b.noticeHours)), farAway, outside });
     } catch (error) { next(error); }
 });
 
@@ -351,6 +380,14 @@ router.post("/", async (req, res) => {
             const gone = items.find((i: any) => unavailable.includes(i.menuItem.id));
             throw badRequest(`Sorry, ${gone?.menuItem?.name || "an item in your cart"} is no longer available.`);
         }
+        // Where the food is going: used for the delivery area check and the tracking map. A failed
+        // lookup never blocks an order (the chef sees the address and decides).
+        const destination = deliveryMethod === 'delivery'
+            ? await geocode(deliveryAddress?.postcode || [deliveryAddress?.line1, deliveryAddress?.city].filter(Boolean).join(', ')).catch(() => null)
+            : null;
+        const farAway = deliveryMethod === 'delivery' ? applyArea(basket, destination, String(deliveryAddress?.postcode ?? "").toUpperCase()) : [];
+        if (farAway.length && req.body.acceptFarWait !== true) throw farWaitNeeded(farAway);
+
         let scheduledFor: Date | null = null;
         if (basket.length) {
             if (req.body.scheduledFor) {
@@ -419,16 +456,14 @@ router.post("/", async (req, res) => {
         // Nothing left to pay by card: the wallet (and no tip) covered it all.
         const needsCard = cardPayments && serverCalculatedTotal > 0;
         if (needsCard && serverCalculatedTotal < 0.3) { await returnEntry(wallet.entryId); throw badRequest("Card payments need an order of at least 30p."); }
-        // Used for the tracking map. A failed lookup never blocks an order.
-        const destination = deliveryMethod === 'delivery'
-            ? await geocode(deliveryAddress?.postcode || [deliveryAddress?.line1, deliveryAddress?.city].filter(Boolean).join(', '))
-            : null;
 
         // A customer's first order (or any order, if Super Admin asks) gets a delivery code.
         const deliveryCode = await codeForNewOrder({ userId: userId ? Number(userId) : null, email: typeof deliveryAddress?.email === "string" ? deliveryAddress.email : null, total: serverCalculatedTotal });
 
         const [{ id: newOrderId }] = await db.insert(orders).values({
             walletAmount: wallet.applied,
+            farAway: farAway.length ? farAway : null,
+            farWaitAcceptedAt: farAway.length ? new Date() : null,
             deliveryCode,
             deliveryLat: destination?.lat ?? null,
             deliveryLng: destination?.lng ?? null,
@@ -476,7 +511,7 @@ router.post("/", async (req, res) => {
         await announceNewOrder(newOrder.id);
         res.status(201).json(newOrder);
     } catch (error: any) {
-        if (error.status) return res.status(error.status).json({ error: error.message });
+        if (error.status) return res.status(error.status).json({ error: error.message, ...(error.details ?? {}) });
         console.error("Create order error:", error);
         res.status(500).json({ error: "Internal server error" });
     }

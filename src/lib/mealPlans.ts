@@ -217,6 +217,10 @@ export async function runMealPlanJobs() {
         await db.update(mealPlans).set({ endingReminderSent: true }).where(eq(mealPlans.id, plan.id));
         await withTemplate("plan.ending_soon", { endDate: plan.endDate }, () => notify(plan.userId, "Your meal plan ends soon", `Your plan finishes on ${plan.endDate}. It won't renew by itself, so renew it if you'd like to carry on.`, `/my-plans/${plan.id}`));
     }
+
+    // Card payments: reminders before the cut-off, and alerts for deliveries still unpaid after it.
+    const { runPlanPaymentJobs } = await import("./planPayments");
+    await runPlanPaymentJobs();
 }
 
 /** Plans made before flexible lengths get their length in weeks filled in, once. */

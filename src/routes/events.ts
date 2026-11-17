@@ -10,6 +10,7 @@ import { assertNoContactDetails } from "../lib/contactGuard";
 import { getBankDetails, getCommissionPercent, notifyAdmins, paymentReference, refreshQuoteStage, roundMoney } from "../lib/eventQuotes";
 import { notify, notifyChef } from "../lib/mealPlans";
 import { badRequest } from "../lib/pricing";
+import { MAX_PEOPLE, peopleLabel, readPeople } from "../lib/people";
 import { rateLimit } from "../lib/rateLimit";
 import { reviewSource } from "./chefReviews";
 
@@ -78,9 +79,12 @@ router.post("/", requireAuth, rateLimit(30, 60_000), async (req, res) => {
     const eventTime = text(req.body.eventTime, 10);
     const contactPhone = text(req.body.contactPhone, 30);
     const specialRequests = text(req.body.specialRequests, 2000) || null;
-    const headcount = Math.floor(Number(req.body.headcount));
     const eventDate = new Date(req.body.eventDate);
-    if (!eventName || !venue || !eventTime || !contactPhone || !(headcount > 0)) throw badRequest("Please complete all the event details");
+    if (!eventName || !venue || !eventTime || !contactPhone) throw badRequest("Please complete all the event details");
+    // Adults and children, so each chef can plan portions and the menu.
+    const people = readPeople(req.body, "headcount", MAX_PEOPLE.event);
+    const headcount = people.total;
+    const who = peopleLabel(people, headcount);
     if (Number.isNaN(eventDate.getTime()) || eventDate.getTime() < Date.now()) throw badRequest("Please choose a date in the future");
     assertNoContactDetails(eventName, venue, specialRequests);
 
@@ -104,7 +108,7 @@ router.post("/", requireAuth, rateLimit(30, 60_000), async (req, res) => {
     const id = await db.transaction(async (tx) => {
         const [{ id: eventId }] = await tx.insert(events).values({
             userId, chefId: chefIds.length === 1 ? chefIds[0] : null, packageType: "multi_chef",
-            eventName, eventDate, eventTime, headcount, venue, contactPhone,
+            eventName, eventDate, eventTime, headcount, adults: people.adults, kids: people.kids, venue, contactPhone,
             contactEmail: account.email,
             selectedItems: [],
             specialRequests,
@@ -114,7 +118,7 @@ router.post("/", requireAuth, rateLimit(30, 60_000), async (req, res) => {
         await tx.insert(eventQuotes).values(requests.map((r) => ({ eventId, chefId: r.chefId, preferences: r.preferences, items: r.items })));
         return eventId;
     });
-    await Promise.all(requests.map((r) => withTemplate("event.quote_request_chef", { eventName, headcount, eventDate: eventDate.toLocaleDateString("en-GB") }, () => notifyChef(r.chefId, "New event quote request", `${eventName}: ${headcount} guests on ${eventDate.toLocaleDateString("en-GB")}. Please send your quote.`, "/chef/dashboard?tab=bookings"))));
+    await Promise.all(requests.map((r) => withTemplate("event.quote_request_chef", { eventName, headcount, people: who, eventDate: eventDate.toLocaleDateString("en-GB") }, () => notifyChef(r.chefId, "New event quote request", `${eventName}: ${headcount} guests (${who}) on ${eventDate.toLocaleDateString("en-GB")}. Please send your quote.`, "/chef/dashboard?tab=bookings"))));
     await withTemplate("event.request_sent", { eventName, chefCount: requests.length }, () => notify(userId, "We've sent your request", `${requests.length} chef${requests.length === 1 ? " has" : "s have"} been asked to quote for ${eventName}. We'll tell you when quotes arrive.`, `/my-bookings/${id}`, "event"));
     await withTemplate("admin.event_booked", { eventName, chefCount: requests.length }, () => notifyAdmins("New event booking", `${eventName} needs quotes from ${requests.length} chef${requests.length === 1 ? "" : "s"}.`, "/admin/events"));
     const [created] = await db.select().from(events).where(eq(events.id, id)).limit(1);
@@ -178,19 +182,24 @@ router.get("/admin/:id", requireAdmin, async (req, res) => {
     });
 });
 
-const eventFields = (b: Record<string, any>) => ({
+const eventFields = (b: Record<string, any>) => {
+    const people = readPeople(b, "headcount", MAX_PEOPLE.event);
+    return {
     eventName: text(b.eventName, 150),
     eventDate: new Date(b.eventDate),
     eventTime: text(b.eventTime, 10),
-    headcount: Math.floor(Number(b.headcount)),
+    headcount: people.total,
+    adults: people.adults,
+    kids: people.kids,
     venue: text(b.venue, 300),
     contactPhone: text(b.contactPhone, 30),
     contactEmail: text(b.contactEmail, 200),
     specialRequests: text(b.specialRequests, 2000) || null,
     adminNotes: text(b.adminNotes, 2000) || null,
-});
+    };
+};
 const missingEventField = (b: Record<string, any>) =>
-    !b.eventName || !b.eventDate || Number.isNaN(new Date(b.eventDate).getTime()) || !b.eventTime || !(Number(b.headcount) > 0) || !b.venue || !b.contactPhone || !b.contactEmail;
+    !b.eventName || !b.eventDate || Number.isNaN(new Date(b.eventDate).getTime()) || !b.eventTime || !(Number(b.headcount) > 0 || Number(b.adults) + Number(b.kids || 0) > 0) || !b.venue || !b.contactPhone || !b.contactEmail;
 
 // POST /events/admin: record a booking taken outside the app, then invite chefs to quote
 router.post("/admin", requireAdmin, async (req, res) => {
@@ -251,7 +260,7 @@ router.post("/admin/:id/quotes", requireAdmin, async (req, res) => {
     const preferences = text(req.body.preferences, 1000) || null;
     await db.insert(eventQuotes).values({ eventId: event.id, chefId, preferences, items: [] });
     await db.update(events).set({ status: "quoting" }).where(eq(events.id, event.id));
-    await withTemplate("event.quote_request_chef", { eventName: event.eventName, headcount: event.headcount, eventDate: "" }, () => notifyChef(chefId, "New event quote request", `${event.eventName}: ${event.headcount} guests. Please send your quote.`, "/chef/dashboard?tab=bookings"));
+    await withTemplate("event.quote_request_chef", { eventName: event.eventName, headcount: event.headcount, people: peopleLabel(event, event.headcount), eventDate: "" }, () => notifyChef(chefId, "New event quote request", `${event.eventName}: ${event.headcount} guests (${peopleLabel(event, event.headcount)}). Please send your quote.`, "/chef/dashboard?tab=bookings"));
     res.status(201).json({ ok: true });
 });
 

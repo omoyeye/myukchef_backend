@@ -99,15 +99,16 @@ export async function startWeekCheckout(planId: number, weekId: number, userId: 
     return { checkoutUrl: session.url! };
 }
 
-async function markWeekPaid(weekId: number, paymentIntentId: string | null) {
+/** Marks a delivery paid (once). Then the customer, Super Admins and the chef are told: see planPayments. */
+export async function markWeekPaid(weekId: number, paymentIntentId: string | null, how: "card" | "admin" = "card") {
     const [claim] = await db.update(mealPlanWeeks).set({ isPaid: true, paidAt: new Date(), stripePaymentIntentId: paymentIntentId })
         .where(and(eq(mealPlanWeeks.id, weekId), eq(mealPlanWeeks.isPaid, false)));
     if (!(claim as unknown as { affectedRows?: number }).affectedRows) return;
     const [week] = await db.select().from(mealPlanWeeks).where(eq(mealPlanWeeks.id, weekId)).limit(1);
     const [plan] = week ? await db.select().from(mealPlans).where(eq(mealPlans.id, week.planId)).limit(1) : [];
     if (!week || !plan) return;
-    await withTemplate("plan.week_paid", { week: week.weekNumber, amount: week.total.toFixed(2) }, () => notify(plan.userId, `Week ${week.weekNumber} paid`, `Thank you. We've received £${week.total.toFixed(2)} for this delivery.`, `/my-plans/${plan.id}`));
-    await withTemplate("plan.week_paid_chef", { week: week.weekNumber }, () => notifyChef(plan.chefId, `Week ${week.weekNumber} paid`, "The customer has paid for this delivery by card.", `/chef/dashboard?tab=plans&plan=${plan.id}`));
+    const { afterWeekPaid } = await import("./planPayments");
+    await afterWeekPaid(week, plan, how);
 }
 
 // === Shared: what Stripe says ===

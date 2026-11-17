@@ -11,6 +11,7 @@ import { milesBetween, publicArea } from "../lib/geo";
 import { notify } from "../lib/mealPlans";
 import { moveChefStage, progressForOrders } from "../lib/orderProgress";
 import { badRequest } from "../lib/pricing";
+import { peopleLabel } from "../lib/people";
 
 const router = Router();
 router.use(requireAuth);
@@ -58,6 +59,8 @@ router.get("/orders", async (req, res) => {
         customerName: string | null; deliveryAddress: { line1?: string; city?: string; postcode?: string; notes?: string } | null;
         /** Where to take it (while the order is open), and how far from the chef's kitchen. */
         destination: { lat: number; lng: number } | null; distanceMiles: number | null;
+        /** Set when the customer is outside this chef's usual area and agreed to wait longer (hours). */
+        farWaitHours: number | null;
         /** Whether the customer's delivery code is needed to finish (never the code itself). */
         codeRequired: boolean; codeLocked: boolean;
         otherChefs: number; items: Line[];
@@ -89,6 +92,7 @@ router.get("/orders", async (req, res) => {
                 distanceMiles: order.deliveryLat !== null && order.deliveryLng !== null && chef.latitude !== null && chef.longitude !== null
                     ? Math.round(milesBetween({ lat: chef.latitude, lng: chef.longitude }, { lat: order.deliveryLat, lng: order.deliveryLng }) * 10) / 10
                     : null,
+                farWaitHours: order.farAway?.find((f) => f.chefId === chef.id)?.extraHours ?? null,
                 codeRequired: false,
                 codeLocked: false,
                 otherChefs: 0,
@@ -164,6 +168,9 @@ router.get("/quotes", async (req, res) => {
                     date: event.eventDate,
                     time: paid ? event.eventTime : null,
                     headcount: event.headcount,
+                    adults: event.adults,
+                    kids: event.kids,
+                    people: peopleLabel(event, event.headcount),
                     status: event.status,
                     paid,
                     venue: paid ? event.venue : null,
