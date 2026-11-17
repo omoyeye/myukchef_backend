@@ -9,6 +9,7 @@ import { refundOrder } from "./payments";
 import { rewardReferral } from "./accounts";
 import { getOrderSettings } from "./pricing";
 import { checkDeliveryCode, codeNote } from "./deliveryCode";
+import { earnLoyalty, returnForOrder } from "./wallet";
 
 /**
  * How a one-off order moves through each chef's kitchen. Chefs move their own part forward one
@@ -122,11 +123,9 @@ async function orderStageChanged(order: OrderRow, next: string) {
     if (next === "completed" && order.status !== "completed" && order.userId) {
         // First delivered order from someone a friend referred: both get their points.
         rewardReferral(order.userId).catch((e) => console.error("Referral reward failed:", e));
-        const { loyalty } = await getOrderSettings();
-        if (loyalty.enabled) {
-            const earned = Math.floor((order.total - (order.tipAmount ?? 0)) * loyalty.earnRatio);
-            await db.update(users).set({ points: sql`${users.points} + ${earned}` }).where(eq(users.id, order.userId));
-        }
+        // Cashback on what they paid (not the tip, and not what their wallet paid). Waits for release.
+        await earnLoyalty(order.userId, (order.total - (order.tipAmount ?? 0)), `Cashback on order #${order.id}`, order.id)
+            .catch((e) => console.error("Loyalty reward failed:", e));
     }
 }
 
@@ -319,6 +318,8 @@ export async function cancelOrder(order: OrderRow, by: "customer" | "admin") {
     // A card payment is refunded first; if Stripe refuses, the order stays as it is.
     const refunded = await refundOrder(order);
     await orderStageChanged(order, "cancelled");
+    // Wallet money used on the order goes back into the wallet.
+    await returnForOrder(order.id);
     await db.update(orders).set({ cancelledBy: by, ...(order.paymentStatus === "awaiting" ? { paymentStatus: "failed" } : {}) }).where(eq(orders.id, order.id));
     await voidOrderInvoices(order.id, `Order #${order.id} was cancelled${refunded ? " and refunded" : ""}, so this invoice won't be paid.`);
     // Chefs never saw an unpaid order, so there's nothing to tell them.

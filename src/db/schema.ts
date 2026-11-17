@@ -203,6 +203,8 @@ export const orders = mysqlTable("orders", {
     deliveryCode: varchar("delivery_code", { length: 8 }),
     // Why a Super Admin let the order be completed without the code (for example, after too many wrong tries).
     deliveryCodeWaived: varchar("delivery_code_waived", { length: 300 }),
+    // Paid from the customer's MYUKCHEF wallet (already taken off the total).
+    walletAmount: double("wallet_amount").default(0).notNull(),
     // not_required (card payments not switched on) | awaiting | paid | refunded | failed
     paymentStatus: varchar("payment_status", { length: 20 }).default("not_required").notNull(),
     stripeSessionId: varchar("stripe_session_id", { length: 255 }),
@@ -709,3 +711,31 @@ export const banners = mysqlTable("banners", {
     createdAt: timestamp("created_at").defaultNow().notNull(),
     updatedAt: timestamp("updated_at").defaultNow().notNull(),
 }, (t) => ({ live: index("banners_live_idx").on(t.active, t.placement) }));
+
+// === WALLETS ===
+// Every movement of a customer's or chef's MYUKCHEF credit is one row, so balances can always be traced.
+// Credits (referral, loyalty, bonus, adjustment, converted points) start "pending" until a Super Admin
+// releases them (or they're released automatically, if the rules say so). Spending at checkout and chef
+// withdrawals are negative amounts.
+export const walletEntries = mysqlTable("wallet_entries", {
+    id: int("id").autoincrement().primaryKey(),
+    userId: int("user_id").references(() => users.id, { onDelete: "cascade" }).notNull(),
+    // referral | loyalty | bonus | adjustment | converted | spend | withdrawal
+    type: varchar("type", { length: 20 }).notNull(),
+    amount: double("amount").notNull(),
+    // credits: pending | released | cancelled. spend: applied | returned. withdrawal: requested | paid | rejected
+    status: varchar("status", { length: 20 }).notNull(),
+    orderId: int("order_id").references(() => orders.id, { onDelete: "set null" }),
+    // For referrals: the friend who joined.
+    relatedUserId: int("related_user_id").references(() => users.id, { onDelete: "set null" }),
+    note: varchar("note", { length: 300 }),
+    // When an automatic release is due (auto-release rule), else null.
+    releaseAt: timestamp("release_at"),
+    createdBy: int("created_by").references(() => users.id, { onDelete: "set null" }),
+    decidedBy: int("decided_by").references(() => users.id, { onDelete: "set null" }),
+    decidedAt: timestamp("decided_at"),
+    // Withdrawals: how they were paid.
+    payoutMethod: varchar("payout_method", { length: 10 }),
+    payoutReference: varchar("payout_reference", { length: 120 }),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+}, (t) => ({ byUser: index("wallet_user_idx").on(t.userId, t.status), byStatus: index("wallet_status_idx").on(t.status, t.type, t.createdAt), byOrder: index("wallet_order_idx").on(t.orderId) }));

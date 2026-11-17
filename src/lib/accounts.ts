@@ -5,6 +5,7 @@ import { siteSettings, users } from "../db/schema";
 import { signPurposeToken, verifyPurposeToken } from "./auth";
 import { sendVerifyEmail } from "./mail";
 import { notify } from "./notify";
+import { earnReferral, getWalletRules } from "./wallet";
 
 /**
  * Things that happen around an account: confirming the email address, and "refer a friend".
@@ -70,18 +71,18 @@ export async function afterSignUp(user: User, referralInput?: unknown) {
     sendVerificationEmail(user).catch((e: Error) => console.error("Confirmation email failed:", e.message));
 }
 
-/** When a referred customer's first order is delivered, they and their friend both get points. Once only. */
+/**
+ * When a referred person's first order is delivered, they and their friend both earn wallet credit.
+ * It waits for a Super Admin to release it (Super Admin, Wallets). Once only.
+ */
 export async function rewardReferral(userId: number) {
     const [user] = await db.select().from(users).where(eq(users.id, userId)).limit(1);
     if (!user?.referredBy || user.referralRewardedAt) return;
-    const rules = await getReferralRules();
-    if (!rules.enabled || rules.points <= 0) return;
+    const rules = await getWalletRules();
+    if (!rules.referral.enabled) return;
     const [claim] = await db.update(users).set({ referralRewardedAt: new Date() }).where(and(eq(users.id, userId), isNull(users.referralRewardedAt)));
     if (!(claim as unknown as { affectedRows?: number }).affectedRows) return;
-    await db.update(users).set({ points: sql`${users.points} + ${rules.points}` }).where(eq(users.id, userId));
-    await db.update(users).set({ points: sql`${users.points} + ${rules.points}` }).where(eq(users.id, user.referredBy));
-    await withTemplate("referral.rewarded_new", { points: rules.points }, () => notify(userId, `You've earned ${rules.points} points`, "Thanks for joining through a friend. Your welcome points are in your account.", "/profile?tab=rewards"));
-    await withTemplate("referral.rewarded_referrer", { points: rules.points, friendName: user.name.split(" ")[0] }, () => notify(user.referredBy!, `You've earned ${rules.points} points`, `${user.name.split(" ")[0]} placed their first order with your code. Thank you for spreading the word!`, "/profile?tab=rewards"));
+    await earnReferral(userId, user.referredBy, user.name);
 }
 
 /** What the "refer a friend" page shows. */
@@ -93,5 +94,13 @@ export async function referralSummary(userId: number) {
         joined: sql<number>`count(*)`,
         rewarded: sql<number>`sum(case when ${users.referralRewardedAt} is not null then 1 else 0 end)`,
     }).from(users).where(eq(users.referredBy, userId));
-    return { ...rules, code: await referralCodeFor(user), joined: Number(counts?.joined ?? 0), rewarded: Number(counts?.rewarded ?? 0) };
+    const wallet = await getWalletRules();
+    return {
+        enabled: wallet.referral.enabled,
+        // Wallet credit, in pounds, for the friend who joins and for the person who referred them.
+        newCustomer: wallet.referral.newCustomer,
+        referrer: wallet.referral.referrer,
+        points: rules.points,
+        code: await referralCodeFor(user), joined: Number(counts?.joined ?? 0), rewarded: Number(counts?.rewarded ?? 0),
+    };
 }

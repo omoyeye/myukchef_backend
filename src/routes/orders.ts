@@ -33,6 +33,7 @@ async function basketChefs(itemIds: string[]) {
 import { getUserId, isAdmin, requireAdmin } from "../lib/auth";
 import { geocode, milesBetween, parseCoordinates } from "../lib/geo";
 import { codeForNewOrder, waiveDeliveryCode } from "../lib/deliveryCode";
+import { linkSpendToOrder, returnEntry, returnForOrder, takeForOrder } from "../lib/wallet";
 import { badRequest, calculateTotals, getOrderSettings, validateDiscount } from "../lib/pricing";
 
 const router = Router();
@@ -410,11 +411,14 @@ router.post("/", async (req, res) => {
         const { total: beforeTip } = calculateTotals(subtotal, deliveryMethod, orderSettings.delivery, discount);
         // A tip goes to the chefs in full, on top of the total.
         const tip = Math.round(Math.min(Math.max(Number(req.body.tip) || 0, 0), 200) * 100) / 100;
-        const serverCalculatedTotal = Math.round((beforeTip + tip) * 100) / 100;
-
         // 4. Create Order
         const { cardPayments } = await paymentConfig();
-        if (cardPayments && serverCalculatedTotal < 0.3) throw badRequest("Card payments need an order of at least 30p.");
+        // Wallet credit (signed-in customers who chose to use it) comes off before the tip, which stays as paid.
+        const wallet = userId ? await takeForOrder(Number(userId), beforeTip, req.body.useWallet, cardPayments ? 0.3 : 0) : { applied: 0, entryId: null };
+        const serverCalculatedTotal = Math.round((beforeTip - wallet.applied + tip) * 100) / 100;
+        // Nothing left to pay by card: the wallet (and no tip) covered it all.
+        const needsCard = cardPayments && serverCalculatedTotal > 0;
+        if (needsCard && serverCalculatedTotal < 0.3) { await returnEntry(wallet.entryId); throw badRequest("Card payments need an order of at least 30p."); }
         // Used for the tracking map. A failed lookup never blocks an order.
         const destination = deliveryMethod === 'delivery'
             ? await geocode(deliveryAddress?.postcode || [deliveryAddress?.line1, deliveryAddress?.city].filter(Boolean).join(', '))
@@ -424,6 +428,7 @@ router.post("/", async (req, res) => {
         const deliveryCode = await codeForNewOrder({ userId: userId ? Number(userId) : null, email: typeof deliveryAddress?.email === "string" ? deliveryAddress.email : null, total: serverCalculatedTotal });
 
         const [{ id: newOrderId }] = await db.insert(orders).values({
+            walletAmount: wallet.applied,
             deliveryCode,
             deliveryLat: destination?.lat ?? null,
             deliveryLng: destination?.lng ?? null,
@@ -434,9 +439,10 @@ router.post("/", async (req, res) => {
             scheduledFor,
             deliveryAddress: { ...deliveryAddress, method: deliveryMethod, discountCode: discount?.code ?? null },
             // With card payments on, nobody hears about the order until Stripe says it's paid.
-            status: cardPayments ? "awaiting_payment" : "received",
-            paymentStatus: cardPayments ? "awaiting" : "not_required",
-        }).$returningId();
+            status: needsCard ? "awaiting_payment" : "received",
+            paymentStatus: needsCard ? "awaiting" : "not_required",
+        }).$returningId().catch(async (e) => { await returnEntry(wallet.entryId); throw e; });
+        await linkSpendToOrder(wallet.entryId, newOrderId);
         const [newOrder] = await db.select().from(orders).where(eq(orders.id, newOrderId)).limit(1);
 
         // 5. Create Order Items
@@ -453,13 +459,14 @@ router.post("/", async (req, res) => {
         await db.insert(orderItems).values(orderItemsData);
 
         const [orderUser] = userId ? await db.select({ email: users.email }).from(users).where(eq(users.id, userId)).limit(1) : [];
-        if (cardPayments) {
+        if (needsCard) {
             let checkoutUrl: string;
             try {
                 checkoutUrl = await startCheckout(newOrder, deliveryAddress?.email || orderUser?.email);
             } catch (error) {
                 // Without a payment page the order can't go ahead.
                 await db.update(orders).set({ status: "cancelled", paymentStatus: "failed" }).where(eq(orders.id, newOrder.id));
+                await returnForOrder(newOrder.id);
                 console.error("Stripe checkout failed:", (error as Error).message);
                 return res.status(502).json({ error: "We couldn't open the payment page. Please try again in a moment." });
             }

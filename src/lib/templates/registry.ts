@@ -43,10 +43,6 @@ export const TEMPLATES: TemplateDef[] = [
     t("account.password_reset", "Account", "customer", "Reset your password", ["firstName"], "Reset your password",
         "We received a request to reset your password. The link below works for one hour. If you didn't ask for this, you can ignore this email.",
         { channels: EMAIL_ONLY, unavailable: ["inApp", "push", "sms"] }),
-    t("referral.rewarded_new", "Account", "customer", "Referral points: new customer", ["points"], "You've earned {{points}} points",
-        "Thanks for joining through a friend. Your welcome points are in your account."),
-    t("referral.rewarded_referrer", "Account", "customer", "Referral points: the friend who referred", ["points", "friendName"], "You've earned {{points}} points",
-        "{{friendName}} placed their first order with your code. Thank you for spreading the word!"),
     t("review.chef_replied", "Account", "customer", "Chef replied to a review", ["reply"], "Your chef replied to your review", "{{reply}}"),
 
     // ===== Orders (customer) =====
@@ -208,12 +204,22 @@ export const TEMPLATES: TemplateDef[] = [
     t("admin.support_email", "Team alerts", "admin", "Support message email", ["name", "email", "phone", "message"], "Support request from {{name}}",
         "Name: {{name}}\nEmail: {{email}}\nPhone: {{phone}}\n\n{{message}}", { channels: EMAIL_ONLY, unavailable: ["inApp", "push", "sms"] }),
     t("admin.error", "Team alerts", "admin", "Error alert", ["source", "message", "where"], "Something went wrong", "{{message}} ({{where}})"),
+    t("admin.withdrawal_requested", "Team alerts", "admin", "Chef wallet withdrawal", ["chefName", "amount"], "Chef wallet withdrawal to pay",
+        "{{chefName}} asked to withdraw £{{amount}} from their wallet.", { channels: ALL }),
     t("admin.delivery_code_locked", "Team alerts", "admin", "Delivery code locked", ["orderId"], "Order #{{orderId}}: delivery code locked",
         "Five wrong delivery codes were entered. Check with the customer, then let the order be completed without the code.", { channels: ALL }),
     t("admin.error_spike", "Team alerts", "admin", "Many errors at once", ["count", "minutes"], "Lots of errors right now",
         "{{count}} errors in the last {{minutes}} minutes. Open System health to see what's failing.", { channels: ALL }),
     t("admin.post_to_review", "Team alerts", "admin", "Chef video to check", ["chefName", "title"], "New chef video to check",
         "{{chefName}} shared \"{{title}}\". Check it's about food.", { channels: { inApp: true, push: true, email: false, sms: false } }),
+
+    // ===== Wallet =====
+    t("wallet.released", "Wallet", "customer", "Wallet credit released (customers and chefs)", ["amount", "reason", "balance"], "£{{amount}} is in your wallet",
+        "{{reason}}. Your wallet now has £{{balance}}. Use it on your next order.", { channels: ALL }),
+    t("wallet.withdrawal_paid", "Wallet", "chef", "Wallet withdrawal sent", ["amount", "method"], "£{{amount}} withdrawal sent",
+        "We've sent £{{amount}} from your wallet {{method}}."),
+    t("wallet.withdrawal_rejected", "Wallet", "chef", "Wallet withdrawal not paid", ["amount", "reason"], "Withdrawal not paid",
+        "Your withdrawal of £{{amount}} wasn't paid: {{reason}}. The money is back in your wallet."),
 
     // ===== Chef videos =====
     t("post.new_video", "Chef videos", "customer", "New video from a chef you follow", ["chefName", "title"], "{{chefName}} shared a new video", "{{title}}",

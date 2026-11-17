@@ -127,7 +127,7 @@ export async function resetTemplate(key: string) {
 export const SAMPLE_VARS: Record<string, string> = {
     firstName: "Sam", orderId: "1042", total: "36.40", amount: "27.00", chefName: "Amara Okafor", chefNames: "Amara Okafor",
     items: "2 x Jollof rice, 1 x Plantain", when: "Friday, 19:00", othersNote: "", week: "3", status: "active", note: "",
-    codeNote: " Your delivery code is 4821. Give it to the person who delivers your food.", months: "3", length: "6 week", weeks: "6", mealsPerWeek: "5", servings: "2", startDate: "2026-12-01", endDate: "2027-03-01", until: "2026-12-14", count: "2",
+    balance: "12.50", codeNote: " Your delivery code is 4821. Give it to the person who delivers your food.", months: "3", length: "6 week", weeks: "6", mealsPerWeek: "5", servings: "2", startDate: "2026-12-01", endDate: "2027-03-01", until: "2026-12-14", count: "2",
     lockedCount: "1", date: "2026-12-05", eventName: "Sam's 40th birthday", headcount: "40", eventDate: "12/12/2026", chefCount: "3",
     update: "will be there", cancelledBy: "the customer", reference: "MYUK-E12", preview: "No onions please, I'm in flat 2.",
     reason: "The name on the certificate doesn't match.", invoiceNumber: "INV-2026-000123", description: "Order #1042", percent: "10",

@@ -83,6 +83,9 @@ export async function settlePayment(order: OrderRow, outcome: PaymentOutcome, pa
     await db.update(orders)
         .set({ paymentStatus: "failed", status: "cancelled" })
         .where(and(eq(orders.id, order.id), eq(orders.paymentStatus, "awaiting")));
+    // Any wallet money put towards the unpaid order goes back.
+    const { returnForOrder } = await import("./wallet");
+    await returnForOrder(order.id);
     return "failed";
 }
 

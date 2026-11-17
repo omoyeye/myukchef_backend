@@ -30,10 +30,12 @@ import templatesRouter from "./routes/templates";
 import postsRouter from "./routes/posts";
 import bannersRouter from "./routes/banners";
 import seoRouter from "./routes/seo";
+import walletRouter from "./routes/wallet";
 import { trackRequests } from "./lib/metrics";
 import { startPayoutJobs } from "./lib/chefPayouts";
 import { startCredentialJobs } from "./lib/credentials";
 import { startWeeklyReports } from "./lib/weeklyReports";
+import { startWalletJobs } from "./lib/wallet";
 import { stripeWebhook } from "./routes/payments";
 import { releaseStaleUnpaidOrders } from "./lib/orderPlaced";
 import { locationRouter } from "./routes/location";
@@ -117,6 +119,7 @@ app.use("/api/admin/templates", templatesRouter);
 app.use("/api/posts", postsRouter);
 app.use("/api/banners", bannersRouter);
 app.use("/api/seo", seoRouter);
+app.use("/api/wallet", walletRouter);
 app.use("/api", (_req, res) => res.status(404).json({ error: "Not found" }));
 
 app.get("/uploads/sm/:file", serveThumbnail);
@@ -171,6 +174,7 @@ app.listen(port, () => {
     startPayoutJobs();
     startCredentialJobs();
     startWeeklyReports();
+    startWalletJobs();
     // Unpaid orders whose payment page ran out are released, in case Stripe's webhook didn't arrive.
     setInterval(() => releaseStaleUnpaidOrders().catch((e) => console.error("Unpaid order check failed:", e)), 15 * 60 * 1000).unref();
     migrateAllergens()

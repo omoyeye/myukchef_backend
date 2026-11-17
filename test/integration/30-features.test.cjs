@@ -137,7 +137,8 @@ const upload = async (p, field, name, type, bytes, token) => {
     ok((await call("POST", `/orders/${toCancel.id}/messages`, { body: "hello" }, fay)).status === 400, "chat closed on a cancelled order");
 
     // ===== Tips =====
-    const before = (await call("GET", "/auth/me", null, fay)).data.user.points;
+    const walletPending = async (token) => (await call("GET", "/wallet", null, token)).data.pending;
+    const before = await walletPending(fay);
     const tipped = (await call("POST", "/orders", orderBody(amaraDish, { tip: 5 }), fay)).data;
     const [[noTipTotal]] = await db.query("SELECT ? - 5 AS t", [tipped.total]);
     ok(tipped.tipAmount === 5, "tip saved on the order");
@@ -148,8 +149,9 @@ const upload = async (p, field, name, type, bytes, token) => {
     const inv = (await call("GET", "/payouts/me", null, amara)).data.invoices.find((i) => i.orderId === tipped.id);
     const gross = Math.round(amaraDish.price * 2 * 100) / 100;
     ok(inv && inv.tipAmount === 5 && inv.netAmount === Math.round((gross - Math.round(gross * 0.1 * 100) / 100 + 5) * 100) / 100, "tip goes to the chef in full, with no commission", inv);
-    const after = (await call("GET", "/auth/me", null, fay)).data.user.points;
-    ok(after - before === Math.floor(noTipTotal.t * 10), "loyalty points don't count the tip", { before, after, total: tipped.total });
+    const after = await walletPending(fay);
+    // Loyalty cashback (2% by default) is pending wallet credit, and doesn't count the tip.
+    ok(Math.round((after - before) * 100) === Math.round(noTipTotal.t * 0.02 * 100), "loyalty cashback doesn't count the tip", { before, after, total: tipped.total });
 
     // ===== VAT on invoices =====
     await call("POST", "/settings", { key: "vat_config", value: { registered: true, rate: 20, number: "GB123456789" } }, admin);
@@ -164,15 +166,15 @@ const upload = async (p, field, name, type, bytes, token) => {
 
     // ===== Refer a friend and email confirmation =====
     const fayRef = (await call("GET", "/auth/referral", null, fay)).data;
-    ok(/^[A-Z2-9]{3,12}$/.test(fayRef.code) && fayRef.points === 500, "customer has a referral code", fayRef);
+    ok(/^[A-Z2-9]{3,12}$/.test(fayRef.code) && fayRef.referrer === 5 && fayRef.newCustomer === 5, "customer has a referral code and the rewards", fayRef);
     const gus = await register("Gus Guest", "gus2@test.local", { referralCode: fayRef.code.toLowerCase() });
     ok(gus.user.emailVerifiedAt == null, "new accounts start unconfirmed");
-    const fayBefore = (await call("GET", "/auth/me", null, fay)).data.user.points;
+    const fayBefore = await walletPending(fay);
     const gusOrder = (await call("POST", "/orders", { ...orderBody(amaraDish), deliveryAddress: { ...orderBody(amaraDish).deliveryAddress, email: "gus2@test.local" } }, gus.token)).data;
     for (const s of ["preparing", "delivery"]) await call("PATCH", `/chef-portal/orders/${gusOrder.id}/status`, { status: s }, amara);
     await call("PATCH", `/chef-portal/orders/${gusOrder.id}/status`, { status: "completed", proof: photo.data.url }, amara);
-    const fayAfter = (await call("GET", "/auth/me", null, fay)).data.user.points;
-    ok(fayAfter - fayBefore === 500, "friend gets points when the referred customer's first order is delivered", { fayBefore, fayAfter });
+    const fayAfter = await walletPending(fay);
+    ok(Math.round((fayAfter - fayBefore) * 100) === 500, "friend earns £5 (pending) when the referred customer's first order is delivered", { fayBefore, fayAfter });
     ok((await call("GET", "/auth/referral", null, fay)).data.joined === 1, "referral counted");
 
     const sign = (payload) => crypto.createHmac("sha256", process.env.AUTH_SECRET).update(payload).digest("base64url");

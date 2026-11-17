@@ -232,7 +232,8 @@ export function startMealPlanJobs() {
     setInterval(run, 60 * 60 * 1000).unref();
 }
 
+/** Cashback on a delivered meal plan week, waiting for a Super Admin to release it. */
 export const addPoints = async (userId: number, total: number) => {
-    const { loyalty } = await getOrderSettings();
-    if (loyalty.enabled) await db.update(users).set({ points: sql`${users.points} + ${Math.floor(total * loyalty.earnRatio)}` }).where(eq(users.id, userId));
+    const { earnLoyalty } = await import("./wallet");
+    await earnLoyalty(userId, total, "Cashback on a meal plan delivery");
 };
