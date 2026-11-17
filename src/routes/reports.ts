@@ -184,7 +184,7 @@ router.get("/weekly/admin", requireAdmin, async (req, res, next) => {
 // POST /reports/weekly/admin/email: sends the report to the signed-in Super Admin now
 router.post("/weekly/admin/email", requireAdmin, emailLimit, async (req, res, next) => {
     try {
-        if (await needsEmail()) return res.status(400).json({ error: "Email isn't set up yet. Add your Brevo key under Payments and email." });
+        if (await needsEmail()) return res.status(400).json({ error: "Email isn't set up yet. Add your Brevo key under Payments & keys." });
         const me = await meOf(req);
         await sendAdminReport([me!.email], weeksAgo(req.body?.weeksAgo));
         res.json({ sentTo: me!.email });

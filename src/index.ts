@@ -29,6 +29,7 @@ import { reportsRouter } from "./routes/reports";
 import templatesRouter from "./routes/templates";
 import postsRouter from "./routes/posts";
 import bannersRouter from "./routes/banners";
+import seoRouter from "./routes/seo";
 import { trackRequests } from "./lib/metrics";
 import { startPayoutJobs } from "./lib/chefPayouts";
 import { startCredentialJobs } from "./lib/credentials";
@@ -52,13 +53,13 @@ const isProduction = process.env.NODE_ENV === "production";
 
 const CONTENT_SECURITY_POLICY = [
     "default-src 'self'",
-    "script-src 'self' https://maps.googleapis.com",
+    "script-src 'self' https://maps.googleapis.com https://www.googletagmanager.com https://www.google-analytics.com https://connect.facebook.net https://analytics.tiktok.com https://www.clarity.ms https://*.clarity.ms",
     "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
     "font-src 'self' data: https://fonts.gstatic.com",
     "img-src 'self' data: blob: https:",
     "media-src 'self' blob:",
-    "frame-src https://www.youtube-nocookie.com https://www.youtube.com",
-    "connect-src 'self' https://maps.googleapis.com https://*.googleapis.com",
+    "frame-src https://www.youtube-nocookie.com https://www.youtube.com https://www.googletagmanager.com",
+    "connect-src 'self' https://maps.googleapis.com https://*.googleapis.com https://*.google-analytics.com https://*.analytics.google.com https://www.googletagmanager.com https://www.facebook.com https://analytics.tiktok.com https://*.clarity.ms",
     "worker-src 'self' blob:",
     "manifest-src 'self'",
     "frame-ancestors 'self'",
@@ -115,6 +116,7 @@ app.use("/api/reports", reportsRouter);
 app.use("/api/admin/templates", templatesRouter);
 app.use("/api/posts", postsRouter);
 app.use("/api/banners", bannersRouter);
+app.use("/api/seo", seoRouter);
 app.use("/api", (_req, res) => res.status(404).json({ error: "Not found" }));
 
 app.get("/uploads/sm/:file", serveThumbnail);

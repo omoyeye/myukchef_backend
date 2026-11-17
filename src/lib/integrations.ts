@@ -4,11 +4,11 @@ import Stripe from "stripe";
 import { db } from "../db";
 import { integrationSettings } from "../db/schema";
 
-// Keys for Stripe and Brevo. Super Admins save them from the admin area; anything they haven't
+// Keys for Stripe, Brevo and Claude (AI writing help in the admin area). Super Admins save them from the admin area; anything they haven't
 // saved falls back to the server's environment variables. Saved values are encrypted, and secret
 // keys are never sent back to the browser in full.
 
-export type Provider = "stripe" | "brevo";
+export type Provider = "stripe" | "brevo" | "claude";
 
 interface FieldSpec {
     label: string;
@@ -32,16 +32,20 @@ export const FIELDS: Record<Provider, Record<string, FieldSpec>> = {
         supportEmail: { label: "Support inbox", env: "SUPPORT_EMAIL", check: isEmail },
         smsSender: { label: "SMS sender name", env: "BREVO_SMS_SENDER", check: (v) => (/^[A-Za-z0-9 ]{1,11}$/.test(v) ? null : "SMS sender names are up to 11 letters or numbers") },
     },
+    claude: {
+        apiKey: { label: "Claude API key", secret: true, env: "ANTHROPIC_API_KEY", check: (v) => (/^sk-ant-[A-Za-z0-9_-]+$/.test(v) ? null : "Claude API keys start with sk-ant-") },
+    },
 };
 // Switches that aren't keys.
-const FLAGS: Record<Provider, string[]> = { stripe: ["enabled"], brevo: [] };
+const FLAGS: Record<Provider, string[]> = { stripe: ["enabled"], brevo: [], claude: [] };
 
 const DEFAULTS: Record<Provider, Record<string, string>> = {
     stripe: {},
     brevo: { senderEmail: "info@myukchef.com", supportEmail: "info@myukchef.com", smsSender: "MYUKCHEF" },
+    claude: {},
 };
 
-export const isProvider = (p: unknown): p is Provider => p === "stripe" || p === "brevo";
+export const isProvider = (p: unknown): p is Provider => p === "stripe" || p === "brevo" || p === "claude";
 
 // === Encryption ===
 
@@ -108,6 +112,12 @@ export async function getBrevo() {
     return { apiKey: fields.apiKey.value, senderEmail: fields.senderEmail.value, supportEmail: fields.supportEmail.value, smsSender: fields.smsSender.value };
 }
 
+/** The Claude API key for AI writing help, or "" when none is set. */
+export async function getClaudeKey() {
+    const { fields } = await resolved("claude");
+    return fields.apiKey.value;
+}
+
 export async function getStripeSettings() {
     const { fields, values } = await resolved("stripe");
     const secretKey = fields.secretKey.value;
@@ -132,7 +142,7 @@ export async function getStripe() {
 
 // === Admin view and changes ===
 
-const mask = (v: string) => (v.length > 8 ? `${v.slice(0, v.indexOf("_", 3) + 1 || 4)}••••${v.slice(-4)}` : "••••");
+const mask = (v: string) => (v.length > 8 ? `${v.startsWith("sk-ant-") ? "sk-ant-" : v.slice(0, v.indexOf("_", 3) + 1 || 4)}••••${v.slice(-4)}` : "••••");
 
 export async function adminView(provider: Provider) {
     const { fields, values } = await resolved(provider);
@@ -199,6 +209,10 @@ export async function clearSettings(provider: Provider) {
 
 /** Checks the keys work by making a harmless read-only call. */
 export async function testConnection(provider: Provider) {
+    if (provider === "claude") {
+        const { checkClaude } = await import("./claude");
+        return checkClaude();
+    }
     if (provider === "brevo") {
         const { apiKey } = await getBrevo();
         if (!apiKey) return { ok: false, message: "No Brevo API key yet." };

@@ -13,7 +13,7 @@ const webhookUrl = (req: Parameters<typeof getUserId>[0]) =>
 // GET /admin/integrations
 router.get("/", async (req, res, next) => {
     try {
-        res.json({ stripe: { ...(await adminView("stripe")), webhookUrl: webhookUrl(req) }, brevo: await adminView("brevo") });
+        res.json({ stripe: { ...(await adminView("stripe")), webhookUrl: webhookUrl(req) }, brevo: await adminView("brevo"), claude: await adminView("claude") });
     } catch (error) { next(error); }
 });
 
