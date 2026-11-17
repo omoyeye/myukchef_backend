@@ -31,7 +31,8 @@ async function basketChefs(itemIds: string[]) {
     return { basket: [...byChef.values()], unavailable };
 }
 import { getUserId, isAdmin, requireAdmin } from "../lib/auth";
-import { geocode, parseCoordinates } from "../lib/geo";
+import { geocode, milesBetween, parseCoordinates } from "../lib/geo";
+import { codeForNewOrder, waiveDeliveryCode } from "../lib/deliveryCode";
 import { badRequest, calculateTotals, getOrderSettings, validateDiscount } from "../lib/pricing";
 
 const router = Router();
@@ -241,8 +242,13 @@ router.get("/:id", async (req, res) => {
         const viewerId = getUserId(req);
         const hasLink = !!order.trackingToken && req.query.t === order.trackingToken;
         const canSeeDetails = hasLink || (viewerId && order.userId === viewerId) || (await isAdmin(viewerId));
-        const { deliveryAddress, deliveryLat, deliveryLng, courierLat, courierLng, courierUpdatedAt, trackingToken: _token, stripeSessionId: _session, stripePaymentIntentId: _intent, ...publicOrder } = order;
+        const { deliveryAddress, deliveryLat, deliveryLng, courierLat, courierLng, courierUpdatedAt, trackingToken: _token, stripeSessionId: _session, stripePaymentIntentId: _intent, deliveryCode, deliveryCodeWaived, ...publicOrder } = order;
         const courierIsLive = order.status === "delivery" && !!courierUpdatedAt && Date.now() - new Date(courierUpdatedAt).getTime() < 30 * 60 * 1000;
+        // A rough arrival time from the driver's position: road distance is about 1.3 times the straight
+        // line, at about 18 mph in town, plus a couple of minutes to park and hand over.
+        const etaMinutes = courierIsLive && deliveryLat !== null && deliveryLng !== null && courierLat !== null && courierLng !== null
+            ? Math.max(1, Math.round((milesBetween({ lat: courierLat, lng: courierLng }, { lat: deliveryLat, lng: deliveryLng }) * 1.3 / 18) * 60 + 2))
+            : null;
 
         // Anyone with the order number sees each chef's stage; the evidence is only for the customer and staff.
         const chefProgress = (await progressForOrder(order)).map((p) => ({
@@ -265,6 +271,9 @@ router.get("/:id", async (req, res) => {
                 deliveryAddress,
                 destination: deliveryLat !== null && deliveryLng !== null ? { lat: deliveryLat, lng: deliveryLng } : null,
                 courier: courierIsLive ? { lat: courierLat, lng: courierLng, updatedAt: courierUpdatedAt } : null,
+                etaMinutes,
+                // The code is only for the customer (and Super Admins), and only until the food arrives.
+                deliveryCode: deliveryCode && !deliveryCodeWaived && order.status !== "completed" && order.status !== "cancelled" ? deliveryCode : null,
             } : { deliveryAddress: null }),
         });
     } catch (error) {
@@ -411,7 +420,11 @@ router.post("/", async (req, res) => {
             ? await geocode(deliveryAddress?.postcode || [deliveryAddress?.line1, deliveryAddress?.city].filter(Boolean).join(', '))
             : null;
 
+        // A customer's first order (or any order, if Super Admin asks) gets a delivery code.
+        const deliveryCode = await codeForNewOrder({ userId: userId ? Number(userId) : null, email: typeof deliveryAddress?.email === "string" ? deliveryAddress.email : null, total: serverCalculatedTotal });
+
         const [{ id: newOrderId }] = await db.insert(orders).values({
+            deliveryCode,
             deliveryLat: destination?.lat ?? null,
             deliveryLng: destination?.lng ?? null,
             trackingToken: crypto.randomBytes(16).toString('hex'),
@@ -480,6 +493,14 @@ router.patch("/:id/courier-location", async (req, res, next) => {
             if (mine.status !== "delivery") return res.status(400).json({ error: "Your part of this order isn't out for delivery" });
         } else if (order.status !== "delivery") return res.status(400).json({ error: "This order isn't out for delivery" });
         await db.update(orders).set({ courierLat: point.lat, courierLng: point.lng, courierUpdatedAt: new Date() }).where(eq(orders.id, id));
+        res.json({ ok: true });
+    } catch (error) { next(error); }
+});
+
+// POST /orders/:id/delivery-code/waive { reason }: a Super Admin lets the order finish without the code
+router.post("/:id/delivery-code/waive", requireAdmin, async (req, res, next) => {
+    try {
+        await waiveDeliveryCode(Number(req.params.id), req.body?.reason);
         res.json({ ok: true });
     } catch (error) { next(error); }
 });

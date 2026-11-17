@@ -8,6 +8,7 @@ import { getPayoutRules, raiseOrderInvoice, splitPayout, voidOrderInvoices } fro
 import { refundOrder } from "./payments";
 import { rewardReferral } from "./accounts";
 import { getOrderSettings } from "./pricing";
+import { checkDeliveryCode, codeNote } from "./deliveryCode";
 
 /**
  * How a one-off order moves through each chef's kitchen. Chefs move their own part forward one
@@ -168,7 +169,7 @@ async function tipShare(order: OrderRow, chefId: number) {
 }
 
 /** A chef moves their part of an order one step on, and the customer hears about it straight away. */
-export async function moveChefStage(orderId: number, chefId: number, next: unknown, proof?: unknown) {
+export async function moveChefStage(orderId: number, chefId: number, next: unknown, proof?: unknown, code?: unknown) {
     const [order] = await db.select().from(orders).where(eq(orders.id, orderId)).limit(1);
     if (!order) throw Object.assign(new Error("Order not found"), { status: 404 });
     if (order.status === "cancelled") throw Object.assign(new Error("This order was cancelled."), { status: 400 });
@@ -187,6 +188,8 @@ export async function moveChefStage(orderId: number, chefId: number, next: unkno
     if (delivered && (typeof proof !== "string" || !PROOF_PHOTO.test(proof))) {
         throw Object.assign(new Error("Add a photo of the food being handed over, so we can pay you."), { status: 400 });
     }
+    // Some orders need the customer's delivery code before they can be marked delivered or collected.
+    if (delivered) await checkDeliveryCode(order, chefId, code);
     // The chef's sales, less MYUKCHEF's commission. Fixed now, so a later change to the rate can't alter it.
     const split = delivered ? splitPayout(await chefShare(orderId, chefId), (await getPayoutRules()).percent) : null;
     const commissionPercent = delivered ? (await getPayoutRules()).percent : null;
@@ -220,7 +223,10 @@ export async function moveChefStage(orderId: number, chefId: number, next: unkno
             "/admin/orders?tab=payouts",
         ));
     } else {
-        await withTemplate(next === "preparing" ? "order.cooking" : pickup ? "order.ready_to_collect" : "order.on_the_way", { orderId: order.id, chefName: mine.chefName, othersNote: othersBehind ? " The rest of your order is still with its other chefs." : "" }, () => notifyCustomer(order, copy.title, othersBehind ? `${copy.message} The rest of your order is still with its other chefs.` : copy.message));
+        const others = othersBehind ? " The rest of your order is still with its other chefs." : "";
+        // On its way / ready to collect: remind the customer of their code.
+        const note = next === "delivery" ? codeNote(order) : "";
+        await withTemplate(next === "preparing" ? "order.cooking" : pickup ? "order.ready_to_collect" : "order.on_the_way", { orderId: order.id, chefName: mine.chefName, othersNote: others, codeNote: note }, () => notifyCustomer(order, copy.title, `${copy.message}${others}${note}`));
     }
 
     return { status: next, orderStatus: overall, progress };

@@ -35,6 +35,8 @@ const sessionEvent = (type, sessionId, orderId, paid) => ({
     const db = await mysql.createConnection({ host: u.hostname, port: Number(u.port || 3306), user: decodeURIComponent(u.username), password: decodeURIComponent(u.password), database: process.env.TEST_DB_NAME });
     await db.query("UPDATE users SET password=? WHERE email LIKE 'demo.chef.%'", [await bcrypt.hash("ChefTest-2026x", 10)]);
     const admin = (await call("POST", "/auth/login", { email: "admin@test.local", password: "AdminTest-2026x", portal: "admin" })).data.token;
+    // Delivery codes are tested in 90-delivery-code; these files deliver without them.
+    await call("POST", "/settings", { key: "delivery_code_config", value: { mode: "off" } }, admin);
     const amara = (await call("POST", "/auth/login", { email: "demo.chef.amara@example.com", password: "ChefTest-2026x", portal: "chef" })).data.token;
     const cara = (await call("POST", "/auth/register", { name: "Cara Customer", email: "cara@test.local", password: "TestPass-2026x", acceptTerms: true })).data?.token ?? (await call("POST", "/auth/login", { email: "cara@test.local", password: "TestPass-2026x" })).data.token;
     ok(admin && amara && cara, "sign in");

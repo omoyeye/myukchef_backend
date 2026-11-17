@@ -2,11 +2,12 @@ import { Request, Router } from "express";
 import { withTemplate } from "../lib/templates";
 import { and, asc, desc, eq, inArray, ne, or } from "drizzle-orm";
 import { db } from "../db";
-import { chefProducts, chefs, eventQuoteMessages, eventQuotes, events, orderItems, orders, products, users } from "../db/schema";
+import { chefProducts, chefs, eventQuoteMessages, eventQuotes, events, orderChefProgress, orderItems, orders, products, users } from "../db/schema";
+import { codeStatusForChef } from "../lib/deliveryCode";
 import { getUserId, requireAuth } from "../lib/auth";
 import { assertNoContactDetails, redactContactDetails } from "../lib/contactGuard";
 import { getCommissionPercent, refreshQuoteStage, roundMoney } from "../lib/eventQuotes";
-import { publicArea } from "../lib/geo";
+import { milesBetween, publicArea } from "../lib/geo";
 import { notify } from "../lib/mealPlans";
 import { moveChefStage, progressForOrders } from "../lib/orderProgress";
 import { badRequest } from "../lib/pricing";
@@ -55,6 +56,10 @@ router.get("/orders", async (req, res) => {
         /** When the customer wants it, and this chef's share of any tip (once delivered). */
         scheduledFor: Date | null; tipAmount: number;
         customerName: string | null; deliveryAddress: { line1?: string; city?: string; postcode?: string; notes?: string } | null;
+        /** Where to take it (while the order is open), and how far from the chef's kitchen. */
+        destination: { lat: number; lng: number } | null; distanceMiles: number | null;
+        /** Whether the customer's delivery code is needed to finish (never the code itself). */
+        codeRequired: boolean; codeLocked: boolean;
         otherChefs: number; items: Line[];
         payoutAmount: number | null; payoutStatus: string | null; deliveryProof: string | null;
         customerConfirmedAt: Date | null; customerIssue: string | null;
@@ -79,6 +84,13 @@ router.get("/orders", async (req, res) => {
                 deliveryAddress: open && address.method !== "pickup"
                     ? { line1: address.line1, city: address.city, postcode: address.postcode, notes: redactContactDetails(address.notes ?? null) ?? undefined }
                     : null,
+                destination: open && address.method !== "pickup" && order.deliveryLat !== null && order.deliveryLng !== null ? { lat: order.deliveryLat, lng: order.deliveryLng } : null,
+                // Distance from the kitchen, or for a collection, from the customer's area (where they're coming from).
+                distanceMiles: order.deliveryLat !== null && order.deliveryLng !== null && chef.latitude !== null && chef.longitude !== null
+                    ? Math.round(milesBetween({ lat: chef.latitude, lng: chef.longitude }, { lat: order.deliveryLat, lng: order.deliveryLng }) * 10) / 10
+                    : null,
+                codeRequired: false,
+                codeLocked: false,
                 otherChefs: 0,
                 items: [],
                 payoutAmount: null,
@@ -92,6 +104,15 @@ router.get("/orders", async (req, res) => {
     }
     const list = [...byOrder.values()];
     const progress = await progressForOrders(list);
+    // Delivery code status for this chef's part of each order.
+    const ids = list.map((o) => o.id);
+    const parts = ids.length ? await db.select({ orderId: orderChefProgress.orderId, codeAttempts: orderChefProgress.codeAttempts, codeVerifiedAt: orderChefProgress.codeVerifiedAt })
+        .from(orderChefProgress).where(and(inArray(orderChefProgress.orderId, ids), eq(orderChefProgress.chefId, chef.id))) : [];
+    const codes = ids.length ? await db.select({ id: orders.id, deliveryCode: orders.deliveryCode, deliveryCodeWaived: orders.deliveryCodeWaived }).from(orders).where(inArray(orders.id, ids)) : [];
+    for (const o of list) {
+        const c = codes.find((x) => x.id === o.id);
+        if (c) Object.assign(o, codeStatusForChef(c, parts.find((p) => p.orderId === o.id)));
+    }
     for (const o of list) {
         const all = progress.get(o.id) ?? [];
         const mine = all.find((p) => p.chefId === chef.id);
@@ -113,7 +134,7 @@ router.get("/orders", async (req, res) => {
 // The customer is told by in-app notice, push and email straight away.
 router.patch("/orders/:id/status", async (req, res) => {
     const chef = await currentChef(req);
-    const result = await moveChefStage(Number(req.params.id), chef.id, req.body?.status, req.body?.proof);
+    const result = await moveChefStage(Number(req.params.id), chef.id, req.body?.status, req.body?.proof, req.body?.code);
     res.json({ status: result.status, orderStatus: result.orderStatus });
 });
 

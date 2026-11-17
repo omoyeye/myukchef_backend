@@ -198,6 +198,11 @@ export const orders = mysqlTable("orders", {
     courierUpdatedAt: timestamp("courier_updated_at"),
     // Lets guests open their own tracking page without an account.
     trackingToken: varchar("tracking_token", { length: 64 }),
+    // A 4-digit code the customer gives the person delivering (or the chef, at collection), like Uber Eats.
+    // Only the customer and Super Admins can see it. Set for a customer's first order, or as the rules say.
+    deliveryCode: varchar("delivery_code", { length: 8 }),
+    // Why a Super Admin let the order be completed without the code (for example, after too many wrong tries).
+    deliveryCodeWaived: varchar("delivery_code_waived", { length: 300 }),
     // not_required (card payments not switched on) | awaiting | paid | refunded | failed
     paymentStatus: varchar("payment_status", { length: 20 }).default("not_required").notNull(),
     stripeSessionId: varchar("stripe_session_id", { length: 255 }),
@@ -234,6 +239,9 @@ export const orderChefProgress = mysqlTable("order_chef_progress", {
     updatedAt: timestamp("updated_at").defaultNow().notNull(),
     // Evidence of fulfilment: the chef's photo of the handover, and the customer's own confirmation.
     deliveryProof: text("delivery_proof"),
+    // The delivery code check for this chef's part: wrong tries, and when the right code was entered.
+    codeAttempts: int("code_attempts").default(0).notNull(),
+    codeVerifiedAt: timestamp("code_verified_at"),
     deliveredAt: timestamp("delivered_at"),
     customerConfirmedAt: timestamp("customer_confirmed_at"),
     customerIssue: text("customer_issue"),

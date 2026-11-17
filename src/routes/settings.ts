@@ -5,6 +5,7 @@ import { eq } from "drizzle-orm";
 import { getUserId, isAdmin, requireAdmin } from "../lib/auth";
 import { cleanTiers } from "../lib/pricing";
 import { forgetBrand } from "../lib/mail";
+import { cleanCodeRules } from "../lib/deliveryCode";
 
 const router = Router();
 
@@ -34,6 +35,9 @@ router.post("/", requireAdmin, async (req, res) => {
     let { value } = req.body;
     // Delivery price bands are tidied before saving, so checkout always gets sensible ones.
     if (key === "delivery_config" && value && typeof value === "object") value = { ...value, tiers: cleanTiers(value.tiers) };
+    if (key === "delivery_code_config") {
+        try { value = cleanCodeRules(value); } catch (e) { return res.status(400).json({ error: (e as Error).message }); }
+    }
     // Payout rules and keys have their own checked endpoints.
     if (key === "chef_commission") return res.status(400).json({ error: "Change the chef commission under Orders, Chef payouts." });
 

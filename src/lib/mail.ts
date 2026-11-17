@@ -144,7 +144,7 @@ export const sendPasswordResetEmail = (to: string, token: string, role = "custom
     });
 };
 
-export const sendOrderConfirmationEmail = async (to: string, order: { id: number; total: number; trackingToken: string | null; scheduledFor?: Date | null; deliveryAddress?: unknown }, lines: { name: string; quantity: number; allergens: string }[] = [], firstName = "") => {
+export const sendOrderConfirmationEmail = async (to: string, order: { id: number; total: number; trackingToken: string | null; scheduledFor?: Date | null; deliveryAddress?: unknown; deliveryCode?: string | null; deliveryCodeWaived?: string | null }, lines: { name: string; quantity: number; allergens: string }[] = [], firstName = "") => {
     const vars = orderPlacedVars(order, lines, firstName);
     const allergens = lines.length ? `<div style="background:#fff7ed;border-radius:12px;padding:14px 16px;margin:6px 0 10px;">
         <p style="margin:0 0 6px;font-weight:700;color:#111827;">Allergen information</p>
@@ -157,8 +157,10 @@ export const sendOrderConfirmationEmail = async (to: string, order: { id: number
 };
 
 /** The placeholders for an order confirmation, shared by the email and the text message. */
-export function orderPlacedVars(order: { id: number; total: number; scheduledFor?: Date | null }, lines: { name: string; quantity: number }[], firstName = "") {
+export function orderPlacedVars(order: { id: number; total: number; scheduledFor?: Date | null; deliveryCode?: string | null; deliveryCodeWaived?: string | null; deliveryAddress?: unknown }, lines: { name: string; quantity: number }[], firstName = "") {
+    const pickup = (order.deliveryAddress as { method?: string } | null)?.method === "pickup";
     return {
+        codeNote: order.deliveryCode && !order.deliveryCodeWaived ? ` Your delivery code is ${order.deliveryCode}. Give it to ${pickup ? "the chef when you collect" : "the person who delivers your food"}.` : "",
         firstName: firstName || "there",
         orderId: order.id,
         total: Number(order.total).toFixed(2),
