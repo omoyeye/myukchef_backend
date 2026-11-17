@@ -140,6 +140,8 @@ export const TEMPLATES: TemplateDef[] = [
     t("event.closed_unpaid", "Events", "customer", "Booking closed unpaid", ["eventName"], "Your booking has closed",
         "The date for {{eventName}} has passed without payment, so the booking has closed. Nothing is owed."),
     t("event.review_request", "Events", "customer", "Ask for a review", ["eventName"], "How was your event?", "We hope {{eventName}} was wonderful. You can now rate your chefs."),
+    t("event.quote_withdrawn_chef", "Events", "chef", "Customer removed this chef", ["eventName", "reason"], "No longer needed for an event", "The customer no longer needs you for {{eventName}}. Nothing further is needed."),
+    t("event.total_changed", "Events", "customer", "Booking total changed", ["eventName", "total"], "Your booking total has changed", "Without that chef, {{eventName}} now comes to £{{total}}."),
     t("event.quote_request_chef", "Events", "chef", "New quote request", ["eventName", "headcount", "people", "eventDate"], "New event quote request",
         "{{eventName}}: {{headcount}} guests ({{people}}). Please send your quote."),
     t("event.quote_chosen", "Events", "chef", "Quote chosen", ["eventName"], "Your quote was chosen",
@@ -186,6 +188,7 @@ export const TEMPLATES: TemplateDef[] = [
     // ===== Team alerts (Super Admin) =====
     t("admin.plan_week_paid", "Team alerts", "admin", "Meal plan week paid", ["planId", "week", "amount", "chefName", "how"], "Meal plan #{{planId}}: week {{week}} paid", "£{{amount}} {{how}}. {{chefName}} has been told to cook."),
     t("admin.plan_week_unpaid", "Team alerts", "admin", "Meal plan week unpaid at cut-off", ["planId", "week", "amount"], "Meal plan #{{planId}}: week {{week}} unpaid", "£{{amount}} wasn't paid by the cut-off. The chef has been told to wait."),
+    t("admin.event_chef_removed", "Team alerts", "admin", "Chef removed from a booking", ["eventName", "total"], "Chef removed from a booking", "The customer removed a chef from {{eventName}}. It now comes to £{{total}}."),
     t("admin.new_order", "Team alerts", "admin", "New order", ["orderId", "total", "paid"], "New Order Received!", "Order #{{orderId}} just came in for £{{total}}{{paid}}",
         { channels: { inApp: true, push: true, email: false, sms: false } }),
     t("admin.order_email", "Team alerts", "admin", "New order email", ["orderId", "total"], "New order #{{orderId}}: £{{total}}",

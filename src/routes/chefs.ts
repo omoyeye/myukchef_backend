@@ -19,6 +19,7 @@ import { rateLimit } from "../lib/rateLimit";
 import { cleanAllergens } from "../lib/allergens";
 import { notify, notifyAdmins, notifyChef } from "../lib/notify";
 import { areaFor, areaSettings } from "../lib/serviceArea";
+import { eventDishFields } from "../lib/eventMenu";
 import { blurCoordinate, geocode, milesBetween, parseCoordinates, publicArea } from "../lib/geo";
 
 const router = Router();
@@ -358,7 +359,7 @@ router.get("/products/public", async (req, res) => {
     try {
         const rows = await db.select({ product: chefProducts })
             .from(chefProducts)
-            .where(and(eq(chefProducts.status, "approved"), eq(chefProducts.allergensDeclared, true)));
+            .where(and(eq(chefProducts.status, "approved"), eq(chefProducts.allergensDeclared, true), eq(chefProducts.forMenu, true)));
         // Only chefs allowed to sell: approved, and hygiene-verified when that rule is on.
         const sellers = await sellingChefs();
         const now = new Date();
@@ -416,6 +417,7 @@ router.post("/me/products", async (req, res) => {
             isVegetarian: !!isVegetarian, isVegan: !!isVegan, isGlutenFree: !!isGlutenFree, isHalal: !!isHalal, isPopular: !!isPopular,
             calories: calories ? Number(calories) : null,
             noticeHours: dishNotice(req.body.noticeHours),
+            ...eventDishFields(req.body),
             status: "pending",
         });
         const [created] = await db.select().from(chefProducts).where(eq(chefProducts.id, id)).limit(1);
@@ -448,6 +450,7 @@ router.put("/me/products/:id", async (req, res) => {
             calories: calories ? Number(calories) : null,
             isSoldOut: !!isSoldOut,
             noticeHours: dishNotice(req.body.noticeHours),
+            ...eventDishFields(req.body, existing),
             status: "pending", // re-moderate after edits
         }).where(eq(chefProducts.id, id));
         const [updated] = await db.select().from(chefProducts).where(eq(chefProducts.id, id)).limit(1);
@@ -768,7 +771,7 @@ router.delete("/admin/products/:id", requireAdmin, async (req, res, next) => {
 router.get("/:chefId/products", async (req, res) => {
     try {
         const chefId = Number(req.params.chefId);
-        const rows = await db.select().from(chefProducts).where(and(eq(chefProducts.chefId, chefId), eq(chefProducts.status, "approved"), eq(chefProducts.allergensDeclared, true)));
+        const rows = await db.select().from(chefProducts).where(and(eq(chefProducts.chefId, chefId), eq(chefProducts.status, "approved"), eq(chefProducts.allergensDeclared, true), eq(chefProducts.forMenu, true)));
         const menuDishes = await db.select().from(products).where(and(eq(products.chefId, chefId), eq(products.allergensDeclared, true)));
         res.json([...menuDishes, ...rows]);
     } catch (error) {

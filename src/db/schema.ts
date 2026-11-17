@@ -93,6 +93,14 @@ export const chefProducts = mysqlTable("chef_products", {
     // Warning this dish needs, when it's more than the chef's usual (for example slow-cooked dishes).
     noticeHours: int("notice_hours"),
     calories: int("calories"),
+    // Where it's offered: the everyday menu, the event menu, or both. Event items can be sold by the
+    // tray, platter, dozen, hour and so on, feed a number of people each, and have their own price and minimum.
+    forMenu: boolean("for_menu").default(true).notNull(),
+    forEvents: boolean("for_events").default(true).notNull(),
+    eventUnit: varchar("event_unit", { length: 20 }),
+    eventServes: int("event_serves"),
+    eventPrice: double("event_price"),
+    eventMinQty: int("event_min_qty"),
     createdAt: timestamp("created_at").defaultNow().notNull(),
 });
 
@@ -134,7 +142,9 @@ export interface QuoteItem {
     image: string;
     quantity: number;
     allergens?: string[];
-    guidePrice: number; // Menu price when requested
+    guidePrice: number; // Menu (or event) price when requested, per unit
+    unit?: string; // portion, tray, platter, dozen... (portion when missing)
+    serves?: number; // People one unit feeds
     unitPrice: number | null; // The chef's price
 }
 

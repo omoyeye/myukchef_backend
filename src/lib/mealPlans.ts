@@ -91,6 +91,7 @@ export async function eligibleDishes(chefId: number, dietary: string[], avoid: s
         eq(chefProducts.chefId, chefId),
         eq(chefProducts.status, "approved"),
         eq(chefProducts.isSoldOut, false),
+        eq(chefProducts.forMenu, true),
         inArray(chefProducts.category, ["mains", "deals"]),
     ));
     return rows.filter((dish) => matchesNeeds(dish, dietary, avoid));

@@ -11,6 +11,8 @@ import { getBankDetails, getCommissionPercent, notifyAdmins, paymentReference, r
 import { notify, notifyChef } from "../lib/mealPlans";
 import { badRequest } from "../lib/pricing";
 import { MAX_PEOPLE, peopleLabel, readPeople } from "../lib/people";
+import { asEventDish, eventMenu } from "../lib/eventMenu";
+import { getStripe } from "../lib/integrations";
 import { rateLimit } from "../lib/rateLimit";
 import { reviewSource } from "./chefReviews";
 
@@ -20,6 +22,15 @@ type Quote = typeof eventQuotes.$inferSelect;
 
 const STATUSES = ["quoting", "quotes_ready", "awaiting_payment", "confirmed", "in_progress", "completed", "cancelled", "pending"];
 const PAID_STAGES = ["confirmed", "in_progress", "completed"];
+// A chef still part of a booking (not declined, not chosen against, not removed by the customer).
+const ACTIVE_QUOTE = ["requested", "submitted", "accepted"];
+
+/** Best effort: closes a Stripe payment page that was opened for an old total. */
+async function expireOpenCheckout(sessionId: string | null) {
+    if (!sessionId) return;
+    const stripe = await getStripe();
+    await stripe?.client.checkout.sessions.expire(sessionId).catch(() => undefined);
+}
 const notFound = () => Object.assign(new Error("Booking not found"), { status: 404 });
 const text = (value: unknown, max: number) => String(value ?? "").trim().slice(0, max);
 
@@ -56,17 +67,23 @@ async function buildChefRequest(chefId: number, items: unknown) {
         .filter((item) => item.id && item.quantity > 0 && item.quantity <= 100000);
     if (wanted.length === 0) return [];
     const ids = wanted.map((item) => item.id);
-    const chefDishes = await db.select().from(chefProducts).where(and(inArray(chefProducts.id, ids), eq(chefProducts.chefId, chefId), eq(chefProducts.status, "approved"), eq(chefProducts.allergensDeclared, true)));
+    const chefDishes = await db.select().from(chefProducts).where(and(inArray(chefProducts.id, ids), eq(chefProducts.chefId, chefId), eq(chefProducts.status, "approved"), eq(chefProducts.allergensDeclared, true), eq(chefProducts.forEvents, true)));
     const menuDishes = await db.select().from(products).where(and(inArray(products.id, ids), eq(products.chefId, chefId), eq(products.allergensDeclared, true)));
-    const dishes = [...chefDishes, ...menuDishes];
+    const dishes = [...chefDishes.map(asEventDish), ...menuDishes.map((d) => asEventDish({ ...d, chefId }))];
     return wanted.map((item): QuoteItem => {
         const dish = dishes.find((d) => d.id === item.id);
         if (!dish) throw badRequest("One of those dishes isn't available from that chef");
-        return { id: dish.id, name: dish.name, image: dish.image, quantity: item.quantity, allergens: dish.allergens ?? [], guidePrice: dish.price, unitPrice: null };
+        if (item.quantity < dish.minQty) throw badRequest(`${dish.name} has a minimum of ${dish.minQty} ${dish.unit}${dish.minQty === 1 ? "" : "s"}`);
+        return { id: dish.id, name: dish.name, image: dish.image, quantity: item.quantity, allergens: dish.allergens, guidePrice: dish.price, unit: dish.unit, serves: dish.serves, unitPrice: null };
     });
 }
 
 // === CUSTOMER ===
+
+// GET /events/menu?chef=: what chefs taking events offer, event-only items first. Public.
+router.get("/menu", async (req, res) => {
+    res.json(await eventMenu(Number(req.query.chef) || undefined));
+});
 
 // POST /events: ask several chefs to quote for one event
 router.post("/", requireAuth, rateLimit(30, 60_000), async (req, res) => {
@@ -405,6 +422,51 @@ router.patch("/:id/cancel", requireAuth, async (req, res) => {
         }
     }
     res.json({ message: "Booking cancelled" });
+});
+
+// PATCH /events/:id/quotes/:quoteId/cancel { reason? }: the customer no longer needs one of their chefs.
+// Free until the booking is paid. The rest of the booking carries on; removing the last chef cancels it.
+router.patch("/:id/quotes/:quoteId/cancel", requireAuth, async (req, res) => {
+    const event = await ownEvent(req);
+    if (PAID_STAGES.includes(event.status) || event.paymentStatus === "paid") throw badRequest("This booking has been paid. Please message MYUKCHEF support to change it.");
+    if (event.paymentStatus === "submitted") throw badRequest("We're checking your payment, so this can't be changed right now. Please message MYUKCHEF support.");
+    if (event.status === "cancelled") throw badRequest("This booking is already cancelled");
+    const quotes = await db.select().from(eventQuotes).where(eq(eventQuotes.eventId, event.id));
+    const quote = quotes.find((q) => q.id === Number(req.params.quoteId));
+    if (!quote) throw Object.assign(new Error("Chef not found on this booking"), { status: 404 });
+    if (!ACTIVE_QUOTE.includes(quote.status)) throw badRequest("This chef is no longer part of the booking");
+    const reason = text(req.body?.reason, 300) || null;
+    assertNoContactDetails(reason);
+
+    await db.update(eventQuotes).set({ status: "withdrawn" }).where(eq(eventQuotes.id, quote.id));
+    await withTemplate("event.quote_withdrawn_chef", { eventName: event.eventName, reason: reason ?? "" }, () => notifyChef(quote.chefId, "No longer needed for an event", `The customer no longer needs you for ${event.eventName}.${reason ? ` They said: "${reason}"` : ""} Nothing further is needed.`, "/chef/dashboard?tab=bookings"));
+
+    const left = quotes.filter((q) => q.id !== quote.id && ACTIVE_QUOTE.includes(q.status));
+    if (left.length === 0) {
+        // That was the last chef: the whole booking is cancelled.
+        await db.update(events).set({ status: "cancelled", stripeSessionId: null }).where(eq(events.id, event.id));
+        return res.json({ status: "cancelled", cancelledAll: true });
+    }
+    if (event.status === "awaiting_payment") {
+        // The total changes, so any open payment page is closed and the customer pays the new amount.
+        await expireOpenCheckout(event.stripeSessionId);
+        const accepted = left.filter((q) => q.status === "accepted");
+        if (accepted.length) {
+            const finalTotal = roundMoney(accepted.reduce((sum, q) => sum + (q.total ?? 0), 0));
+            await db.update(events).set({ finalTotal, stripeSessionId: null }).where(eq(events.id, event.id));
+            await withTemplate("event.total_changed", { eventName: event.eventName, total: finalTotal.toFixed(2) }, () => notify(event.userId, "Your booking total has changed", `Without that chef, ${event.eventName} now comes to £${finalTotal.toFixed(2)}.`, `/my-bookings/${event.id}`, "event"));
+            await withTemplate("admin.event_chef_removed", { eventName: event.eventName, total: finalTotal.toFixed(2) }, () => notifyAdmins("Chef removed from a booking", `The customer removed a chef from ${event.eventName}. It now comes to £${finalTotal.toFixed(2)}.`, "/admin/events"));
+            return res.json({ status: event.status, finalTotal });
+        }
+        // No chosen chefs left: back to choosing from the other quotes.
+        await db.update(events).set({ status: "quotes_ready", finalTotal: null, stripeSessionId: null }).where(eq(events.id, event.id));
+        await db.update(eventQuotes).set({ status: "submitted" }).where(and(eq(eventQuotes.eventId, event.id), eq(eventQuotes.status, "not_selected")));
+        return res.json({ status: "quotes_ready" });
+    }
+    // Still collecting quotes: if everyone left has replied, the customer can now compare.
+    await refreshQuoteStage(event.id);
+    const [fresh] = await db.select({ status: events.status }).from(events).where(eq(events.id, event.id)).limit(1);
+    res.json({ status: fresh?.status ?? event.status });
 });
 
 // POST /events/quotes/:quoteId/messages: chat about one quote, checked for contact details

@@ -68,6 +68,24 @@ router.patch("/read-all", async (req, res) => {
     }
 });
 
+// DELETE /notifications?only=read: clears the read ones (or, without ?only=read, every notification)
+router.delete("/", requireAuth, async (req, res) => {
+    const userId = getUserId(req);
+    const onlyRead = req.query.only === "read";
+    await db.delete(notifications).where(onlyRead ? and(eq(notifications.userId, userId), eq(notifications.isRead, true)) : eq(notifications.userId, userId));
+    res.json({ message: onlyRead ? "Read notifications cleared" : "All notifications cleared" });
+});
+
+// DELETE /notifications/:id: removes one of your own notifications
+router.delete("/:id", requireAuth, async (req, res) => {
+    const userId = getUserId(req);
+    const id = Number(req.params.id);
+    const [mine] = Number.isInteger(id) ? await db.select({ id: notifications.id }).from(notifications).where(and(eq(notifications.id, id), eq(notifications.userId, userId))).limit(1) : [];
+    if (!mine) return res.status(404).json({ error: "Notification not found" });
+    await db.delete(notifications).where(eq(notifications.id, id));
+    res.json({ message: "Notification deleted" });
+});
+
 // GET and PUT /notifications/preferences
 router.get("/preferences", requireAuth, async (req, res) => {
     res.json(await getPreferences(getUserId(req)));

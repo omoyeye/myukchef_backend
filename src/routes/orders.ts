@@ -372,7 +372,7 @@ router.post("/", async (req, res) => {
         const dbChefProducts = await db.select({ id: chefProducts.id, name: chefProducts.name, price: chefProducts.price, isSoldOut: chefProducts.isSoldOut, allergens: chefProducts.allergens, chefId: chefProducts.chefId })
             .from(chefProducts)
             .innerJoin(chefs, eq(chefProducts.chefId, chefs.id))
-            .where(and(inArray(chefProducts.id, productIds), eq(chefProducts.status, "approved"), eq(chefProducts.allergensDeclared, true), eq(chefs.status, "approved")));
+            .where(and(inArray(chefProducts.id, productIds), eq(chefProducts.status, "approved"), eq(chefProducts.allergensDeclared, true), eq(chefProducts.forMenu, true), eq(chefs.status, "approved")));
 
         // Every chef in the basket must be allowed to sell, taking orders, and able to cook for the chosen time.
         const { basket, unavailable } = await basketChefs(productIds);

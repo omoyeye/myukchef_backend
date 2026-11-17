@@ -16,7 +16,7 @@ async function publicDishes() {
         .select({ product: chefProducts })
         .from(chefProducts)
         .innerJoin(chefs, eq(chefProducts.chefId, chefs.id))
-        .where(and(eq(chefProducts.status, "approved"), eq(chefProducts.allergensDeclared, true), eq(chefs.status, "approved")));
+        .where(and(eq(chefProducts.status, "approved"), eq(chefProducts.allergensDeclared, true), eq(chefProducts.forMenu, true), eq(chefs.status, "approved")));
     return [...regular, ...chefRows.map((r) => r.product)];
 }
 

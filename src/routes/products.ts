@@ -61,7 +61,7 @@ router.get("/:id", async (req, res) => {
         const [chefDish] = await db.select({ product: chefProducts, chef: chefs })
             .from(chefProducts)
             .innerJoin(chefs, eq(chefProducts.chefId, chefs.id))
-            .where(and(eq(chefProducts.id, id), eq(chefProducts.status, "approved"), eq(chefProducts.allergensDeclared, true), eq(chefs.status, "approved")))
+            .where(and(eq(chefProducts.id, id), eq(chefProducts.status, "approved"), eq(chefProducts.allergensDeclared, true), eq(chefProducts.forMenu, true), eq(chefs.status, "approved")))
             .limit(1);
 
         if (!chefDish || !(await sellingChefs([chefDish.chef.id])).has(chefDish.chef.id)) {
